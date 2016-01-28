@@ -35,7 +35,7 @@ RUN pip install --no-cache-dir -r /tmp/ironic-python-agent/requirements.txt
 RUN pip install --no-cache-dir /tmp/ironic-python-agent
 
 # Remove no longer needed packages
-RUN apt-get -y purge gcc-4.6 gcc python2.7-dev git && \
+RUN apt-get -y purge gcc-4.6 gcc python2.7-dev && \
     apt-get -y autoremove && \
     apt-get clean
 RUN rm -rf /tmp/ironic-python-agent
