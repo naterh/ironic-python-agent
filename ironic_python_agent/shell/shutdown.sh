@@ -21,6 +21,10 @@ set -e
 # Make sure all functions of sysrq is enabled.
 echo "1" > /proc/sys/kernel/sysrq
 
+# Stop any MD Raid devices twice to make sure ordering is correct
+mdadm --stop /dev/md*
+mdadm --stop /dev/md*
+
 echo "s" > /proc/sysrq-trigger
 if [[ $1 = '-h' ]]; then
     echo "o" > /proc/sysrq-trigger
