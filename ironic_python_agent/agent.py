@@ -19,37 +19,34 @@ import socket
 import threading
 import time
 
+from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_log import log
 import pkg_resources
+from six.moves.urllib import parse as urlparse
 from stevedore import extension
 from wsgiref import simple_server
 
 from ironic_python_agent.api import app
-from ironic_python_agent.common import metrics
 from ironic_python_agent import encoding
 from ironic_python_agent import errors
 from ironic_python_agent.extensions import base
 from ironic_python_agent import hardware
 from ironic_python_agent import inspector
 from ironic_python_agent import ironic_api_client
+from ironic_python_agent import utils
 
+LOG = log.getLogger(__name__)
 
-service_opts = [
-    cfg.StrOpt('host',
-               default=socket.getfqdn(),
-               help='Name of this node.  This can be an opaque identifier.  '
-               'It is not necessarily a hostname, FQDN, or IP address. '
-               'However, the node name must be valid within '
-               'an AMQP key, and if using ZeroMQ, a valid '
-               'hostname, FQDN, or IP address.'),
-    cfg.StrOpt('node_uuid',
-               help='This node\'s Ironic UUID. This will be set automatically '
-                    'when the node boots by querying Ironic and should not'
-                    'need to be set in the config file.'),
-]
+# Time(in seconds) to wait for any of the interfaces to be up
+# before lookup of the node is attempted
+NETWORK_WAIT_TIMEOUT = 60
 
-cfg.CONF.register_opts(service_opts)
+# Time(in seconds) to wait before reattempt
+NETWORK_WAIT_RETRY = 5
+
+cfg.CONF.import_group('metrics', 'ironic_lib.metrics_utils')
+cfg.CONF.import_group('metrics_statsd', 'ironic_lib.metrics_statsd')
 
 
 def _time():
@@ -91,9 +88,7 @@ class IronicPythonAgentHeartbeater(threading.Thread):
         """
         super(IronicPythonAgentHeartbeater, self).__init__()
         self.agent = agent
-        self.api = ironic_api_client.APIClient(agent.api_url,
-                                               agent.driver_name)
-        self.log = log.getLogger(__name__)
+        self.api = agent.api_client
         self.error_delay = self.initial_delay
         self.reader = None
         self.writer = None
@@ -101,7 +96,7 @@ class IronicPythonAgentHeartbeater(threading.Thread):
     def run(self):
         """Start the heartbeat thread."""
         # The first heartbeat happens immediately
-        self.log.info('starting heartbeater')
+        LOG.info('starting heartbeater')
         interval = 0
         self.agent.set_agent_advertise_addr()
 
@@ -120,7 +115,7 @@ class IronicPythonAgentHeartbeater(threading.Thread):
                     self.max_jitter_multiplier)
                 interval = self.agent.heartbeat_timeout * interval_multiplier
                 log_msg = 'sleeping before next heartbeat, interval: {0}'
-                self.log.info(log_msg.format(interval))
+                LOG.info(log_msg.format(interval))
         finally:
             os.close(self.reader)
             os.close(self.writer)
@@ -135,9 +130,13 @@ class IronicPythonAgentHeartbeater(threading.Thread):
                 advertise_address=self.agent.advertise_address
             )
             self.error_delay = self.initial_delay
-            self.log.info('heartbeat successful')
+            LOG.info('heartbeat successful')
+        except errors.HeartbeatConflictError:
+            LOG.warning('conflict error sending heartbeat')
+            self.error_delay = min(self.error_delay * self.backoff_factor,
+                                   self.max_delay)
         except Exception:
-            self.log.exception('error sending heartbeat')
+            LOG.exception('error sending heartbeat')
             self.error_delay = min(self.error_delay * self.backoff_factor,
                                    self.max_delay)
 
@@ -147,7 +146,7 @@ class IronicPythonAgentHeartbeater(threading.Thread):
     def stop(self):
         """Stop the heartbeat thread."""
         if self.writer is not None:
-            self.log.info('stopping heartbeater')
+            LOG.info('stopping heartbeater')
             os.write(self.writer, 'a')
             return self.join()
 
@@ -157,7 +156,8 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
 
     def __init__(self, api_url, advertise_address, listen_address,
                  ip_lookup_attempts, ip_lookup_sleep, network_interface,
-                 lookup_timeout, lookup_interval, driver_name, standalone):
+                 lookup_timeout, lookup_interval, driver_name, standalone,
+                 hardware_initialization_delay=0):
         super(IronicPythonAgent, self).__init__()
         self.ext_mgr = extension.ExtensionManager(
             namespace='ironic_python_agent.extensions',
@@ -176,7 +176,6 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         self.api = app.VersionSelectorApplication(self)
         self.heartbeater = IronicPythonAgentHeartbeater(self)
         self.heartbeat_timeout = None
-        self.log = log.getLogger(__name__)
         self.started_at = None
         self.node = None
         # lookup timeout in seconds
@@ -186,6 +185,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         self.ip_lookup_sleep = ip_lookup_sleep
         self.network_interface = network_interface
         self.standalone = standalone
+        self.hardware_initialization_delay = hardware_initialization_delay
 
     def get_status(self):
         """Retrieve a serializable status.
@@ -198,6 +198,21 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
             version=self.version
         )
 
+    def _get_route_source(self, dest):
+        """Get the IP address to send packages to destination."""
+        try:
+            out, _err = utils.execute('ip', 'route', 'get', dest)
+        except (EnvironmentError, processutils.ProcessExecutionError) as e:
+            LOG.warning('Cannot get route to host %(dest)s: %(err)s',
+                        {'dest': dest, 'err': e})
+            return
+
+        try:
+            return out.strip().split('\n')[0].split('src')[1].strip()
+        except IndexError:
+            LOG.warning('No route to host %(dest)s, route record: %(rec)s',
+                        {'dest': dest, 'rec': out})
+
     def set_agent_advertise_addr(self):
         """Set advertised IP address for the agent, if not already set.
 
@@ -205,52 +220,38 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         find a better one.  If the agent's network interface is None, replace
         that as well.
 
-        :raises: LookupAgentInterfaceError if a valid network interface cannot
-                 be found.
         :raises: LookupAgentIPError if an IP address could not be found
         """
         if self.advertise_address[0] is not None:
             return
 
-        if self.network_interface is None:
-            ifaces = self.get_agent_network_interfaces()
+        found_ip = None
+        if self.network_interface is not None:
+            # TODO(dtantsur): deprecate this
+            found_ip = hardware.dispatch_to_managers('get_ipv4_addr',
+                                                     self.network_interface)
         else:
-            ifaces = [self.network_interface]
+            url = urlparse.urlparse(self.api_url)
+            ironic_host = url.hostname
+            # Try resolving it in case it's not an IP address
+            try:
+                ironic_host = socket.gethostbyname(ironic_host)
+            except socket.gaierror:
+                LOG.debug('Count not resolve %s, maybe no DNS', ironic_host)
 
-        attempts = 0
-        while (attempts < self.ip_lookup_attempts):
-            for iface in ifaces:
-                found_ip = hardware.dispatch_to_managers('get_ipv4_addr',
-                                                         iface)
-                if found_ip is not None:
-                    self.advertise_address = (found_ip,
-                                              self.advertise_address[1])
-                    self.network_interface = iface
-                    return
-            attempts += 1
-            time.sleep(self.ip_lookup_sleep)
+            for attempt in range(self.ip_lookup_attempts):
+                found_ip = self._get_route_source(ironic_host)
+                if found_ip:
+                    break
 
-        raise errors.LookupAgentIPError('Agent could not find a valid IP '
-                                        'address.')
+                time.sleep(self.ip_lookup_sleep)
 
-    def get_agent_network_interfaces(self):
-        """Get a list of all network interfaces available.
-
-        Excludes loopback connections.
-
-        :returns: list of network interfaces available.
-        :raises: LookupAgentInterfaceError if a valid interface could not
-                 be found.
-        """
-        iface_list = [iface.serialize()['name'] for iface in
-                      hardware.dispatch_to_managers('list_network_interfaces')]
-        iface_list = [name for name in iface_list if 'lo' not in name]
-
-        if len(iface_list) == 0:
-            raise errors.LookupAgentInterfaceError('Agent could not find a '
-                                                   'valid network interface.')
+        if found_ip:
+            self.advertise_address = (found_ip,
+                                      self.advertise_address[1])
         else:
-            return iface_list
+            raise errors.LookupAgentIPError('Agent could not find a valid IP '
+                                            'address.')
 
     def get_node_uuid(self):
         """Get UUID for Ironic node.
@@ -291,6 +292,24 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         if not self.standalone:
             self.heartbeater.force_heartbeat()
 
+    def _wait_for_interface(self):
+        """Wait until at least one interface is up."""
+
+        wait_till = time.time() + NETWORK_WAIT_TIMEOUT
+        while time.time() < wait_till:
+            interfaces = hardware.dispatch_to_managers(
+                'list_network_interfaces')
+            if not any(ifc.mac_address for ifc in interfaces):
+                LOG.debug('Network is not up yet. '
+                          'No valid interfaces found, retrying ...')
+                time.sleep(NETWORK_WAIT_RETRY)
+            else:
+                break
+
+        else:
+            LOG.warning("No valid network interfaces found. "
+                        "Node lookup will probably fail.")
+
     def run(self):
         """Run the Ironic Python Agent."""
         # Get the UUID so we can heartbeat to Ironic. Raises LookupNodeError
@@ -299,12 +318,19 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
 
         # Cached hw managers at runtime, not load time. See bug 1490008.
         hardware.load_managers()
+        # Operator-settable delay before hardware actually comes up.
+        # Helps with slow RAID drivers - see bug 1582797.
+        if self.hardware_initialization_delay > 0:
+            LOG.info('Waiting %d seconds before proceeding',
+                     self.hardware_initialization_delay)
+            time.sleep(self.hardware_initialization_delay)
 
         if not self.standalone:
             # Inspection should be started before call to lookup, otherwise
             # lookup will fail due to unknown MAC.
             uuid = inspector.inspect()
 
+            self._wait_for_interface()
             content = self.api_client.lookup_node(
                 hardware_info=hardware.dispatch_to_managers(
                     'list_hardware_info'),
@@ -312,21 +338,20 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
                 starting_interval=self.lookup_interval,
                 node_uuid=uuid)
 
+            LOG.debug('Received lookup results: %s', content)
             self.node = content['node']
-            self.heartbeat_timeout = content['heartbeat_timeout']
-
-            # Save node uuid to CONF so we can use it later
-            if self.node.get('uuid'):
-                cfg.CONF.node_uuid = self.node['uuid']
-
-            self.heartbeat_timeout = content['heartbeat_timeout']
+            LOG.info('Lookup succeeded, node UUID is %s', self.node['uuid'])
+            hardware.cache_node(self.node)
+            self.heartbeat_timeout = content['config']['heartbeat_timeout']
 
             # Update config with values from Ironic
             config = content.get('config', {})
             if config.get('metrics'):
-                self.log.info('Updating metrics config with values from '
-                              'Ironic: {}'.format(config['metrics']))
-                metrics.set_config(config['metrics'])
+                for opt, val in config.items():
+                    setattr(cfg.CONF.metrics, opt, val)
+            if config.get('metrics_statsd'):
+                for opt, val in config.items():
+                    setattr(cfg.CONF.metrics_statsd, opt, val)
 
         wsgi = simple_server.make_server(
             self.listen_address[0],
@@ -341,7 +366,7 @@ class IronicPythonAgent(base.ExecuteCommandMixin):
         try:
             wsgi.serve_forever()
         except BaseException:
-            self.log.exception('shutting down')
+            LOG.exception('shutting down')
 
         if not self.standalone:
             self.heartbeater.stop()

@@ -55,6 +55,14 @@ class BaseCommandResult(encoding.SerializableComparable):
         self.command_error = None
         self.command_result = None
 
+    def __str__(self):
+        return ("Command name: %(name)s, "
+                "params: %(params)s, status: %(status)s, result: "
+                "%(result)s." %
+                {"name": self.command_name, "params": self.command_params,
+                 "status": self.command_status,
+                 "result": self.command_result})
+
     def is_done(self):
         """Checks to see if command is still RUNNING.
 
@@ -182,7 +190,6 @@ class BaseAgentExtension(object):
     def __init__(self, agent=None):
         super(BaseAgentExtension, self).__init__()
         self.agent = agent
-        self.log = log.getLogger(__name__)
         self.command_map = dict(
             (v.command_name, v)
             for k, v in inspect.getmembers(self)

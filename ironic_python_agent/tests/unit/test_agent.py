@@ -13,9 +13,11 @@
 # limitations under the License.
 
 import json
+import socket
 import time
 
 import mock
+from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslotest import base as test_base
 import pkg_resources
@@ -28,6 +30,7 @@ from ironic_python_agent import errors
 from ironic_python_agent.extensions import base
 from ironic_python_agent import hardware
 from ironic_python_agent import inspector
+from ironic_python_agent import utils
 
 EXPECTED_ERROR = RuntimeError('command execution failed')
 
@@ -121,9 +124,11 @@ class TestHeartbeater(test_base.BaseTestCase):
         # Validate expectations
         self.assertEqual(expected_poll_calls,
                          mock_poll.return_value.poll.call_args_list)
-        self.assertEqual(self.heartbeater.error_delay, 2.7)
+        self.assertEqual(2.7, self.heartbeater.error_delay)
 
 
+@mock.patch.object(hardware.GenericHardwareManager, '_wait_for_disks',
+                   lambda self: None)
 class TestBaseAgent(test_base.BaseTestCase):
 
     def setUp(self):
@@ -145,6 +150,8 @@ class TestBaseAgent(test_base.BaseTestCase):
             make_test_instance([extension.Extension('fake', None,
                                                     FakeExtension,
                                                     FakeExtension())])
+        self.sample_nw_iface = hardware.NetworkInterface(
+            "eth9", "AA:BB:CC:DD:EE:FF", "1.2.3.4", True)
 
     def assertEqualEncoded(self, a, b):
         # Evidently JSONEncoder.default() can't handle None (??) so we have to
@@ -159,16 +166,17 @@ class TestBaseAgent(test_base.BaseTestCase):
         self.agent.started_at = started_at
 
         status = self.agent.get_status()
-        self.assertTrue(isinstance(status, agent.IronicPythonAgentStatus))
-        self.assertEqual(status.started_at, started_at)
-        self.assertEqual(status.version,
-                         pkg_resources.get_distribution('ironic-python-agent')
-                         .version)
+        self.assertIsInstance(status, agent.IronicPythonAgentStatus)
+        self.assertEqual(started_at, status.started_at)
+        self.assertEqual(pkg_resources.get_distribution('ironic-python-agent')
+                         .version, status.version)
 
+    @mock.patch.object(agent.IronicPythonAgent,
+                       '_wait_for_interface')
+    @mock.patch.object(hardware, 'dispatch_to_managers', autospec=True)
     @mock.patch('wsgiref.simple_server.make_server', autospec=True)
-    @mock.patch.object(hardware.HardwareManager, 'list_hardware_info')
-    def test_run(self, mocked_list_hardware, wsgi_server_cls):
-        CONF.set_override('inspection_callback_url', '')
+    def test_run(self, wsgi_server_cls, mocked_dispatch, mocked_wait):
+        CONF.set_override('inspection_callback_url', '', enforce_type=True)
         wsgi_server = wsgi_server_cls.return_value
         wsgi_server.start.side_effect = KeyboardInterrupt()
 
@@ -178,7 +186,9 @@ class TestBaseAgent(test_base.BaseTestCase):
             'node': {
                 'uuid': 'deadbeef-dabb-ad00-b105-f00d00bab10c'
             },
-            'heartbeat_timeout': 300
+            'config': {
+                'heartbeat_timeout': 300
+            }
         }
         self.agent.run()
 
@@ -189,15 +199,21 @@ class TestBaseAgent(test_base.BaseTestCase):
             self.agent.api,
             server_class=simple_server.WSGIServer)
         wsgi_server.serve_forever.assert_called_once_with()
-
+        mocked_wait.assert_called_once_with()
+        mocked_dispatch.assert_called_once_with("list_hardware_info")
         self.agent.heartbeater.start.assert_called_once_with()
 
+    @mock.patch.object(agent.IronicPythonAgent,
+                       '_wait_for_interface')
     @mock.patch.object(inspector, 'inspect', autospec=True)
+    @mock.patch.object(hardware, 'dispatch_to_managers', autospec=True)
     @mock.patch('wsgiref.simple_server.make_server', autospec=True)
     @mock.patch.object(hardware.HardwareManager, 'list_hardware_info')
     def test_run_with_inspection(self, mocked_list_hardware, wsgi_server_cls,
-                                 mocked_inspector):
-        CONF.set_override('inspection_callback_url', 'http://foo/bar')
+                                 mocked_dispatch, mocked_inspector,
+                                 mocked_wait):
+        CONF.set_override('inspection_callback_url', 'http://foo/bar',
+                          enforce_type=True)
 
         wsgi_server = wsgi_server_cls.return_value
         wsgi_server.start.side_effect = KeyboardInterrupt()
@@ -210,7 +226,9 @@ class TestBaseAgent(test_base.BaseTestCase):
             'node': {
                 'uuid': 'deadbeef-dabb-ad00-b105-f00d00bab10c'
             },
-            'heartbeat_timeout': 300,
+            'config': {
+                'heartbeat_timeout': 300,
+            }
         }
         self.agent.run()
 
@@ -227,57 +245,68 @@ class TestBaseAgent(test_base.BaseTestCase):
             'uuid',
             self.agent.api_client.lookup_node.call_args[1]['node_uuid'])
 
+        mocked_wait.assert_called_once_with()
+        mocked_dispatch.assert_called_once_with("list_hardware_info")
         self.agent.heartbeater.start.assert_called_once_with()
 
-    @mock.patch('os.read')
-    @mock.patch('select.poll')
-    @mock.patch('time.sleep', return_value=None)
-    @mock.patch.object(hardware.GenericHardwareManager,
-                       'list_network_interfaces')
-    @mock.patch.object(hardware.GenericHardwareManager, 'get_ipv4_addr')
-    def test_ipv4_lookup(self,
-                         mock_get_ipv4,
-                         mock_list_net,
-                         mock_time_sleep,
-                         mock_poll,
-                         mock_read):
-        homeless_agent = agent.IronicPythonAgent('https://fake_api.example.'
-                                                 'org:8081/',
-                                                 (None, 9990),
-                                                 ('192.0.2.1', 9999),
-                                                 3,
-                                                 10,
-                                                 None,
-                                                 300,
-                                                 1,
-                                                 'agent_ipmitool',
-                                                 False)
+    @mock.patch.object(time, 'time', autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(hardware, 'dispatch_to_managers', autospec=True)
+    def test__wait_for_interface(self, mocked_dispatch, mocked_sleep,
+                                 mock_time):
+        mocked_dispatch.return_value = [self.sample_nw_iface, {}]
+        mock_time.return_value = 10
+        self.agent._wait_for_interface()
+        mocked_dispatch.assert_called_once_with('list_network_interfaces')
+        self.assertFalse(mocked_sleep.called)
 
-        mock_poll.return_value.poll.return_value = True
-        mock_read.return_value = 'a'
+    @mock.patch.object(time, 'time', autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(hardware, 'dispatch_to_managers', autospec=True)
+    def test__wait_for_interface_expired(self, mocked_dispatch, mocked_sleep,
+                                         mock_time):
+        mock_time.side_effect = [10, 11, 20, 25, 30]
+        mocked_dispatch.side_effect = [[], [], [self.sample_nw_iface], {}]
+        expected_sleep_calls = [mock.call(agent.NETWORK_WAIT_RETRY)] * 2
+        expected_dispatch_calls = [mock.call("list_network_interfaces")] * 3
+        self.agent._wait_for_interface()
+        mocked_dispatch.assert_has_calls(expected_dispatch_calls)
+        mocked_sleep.assert_has_calls(expected_sleep_calls)
 
-        # Can't find network interfaces, and therefore can't find IP
-        mock_list_net.return_value = []
-        mock_get_ipv4.return_value = None
-        self.assertRaises(errors.LookupAgentInterfaceError,
-                          homeless_agent.set_agent_advertise_addr)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch('wsgiref.simple_server.make_server', autospec=True)
+    @mock.patch.object(hardware, '_check_for_iscsi', autospec=True)
+    @mock.patch.object(hardware.HardwareManager, 'list_hardware_info')
+    def test_run_with_sleep(self, mock_check_for_iscsi, mocked_list_hardware,
+                            wsgi_server_cls, mocked_sleep):
+        CONF.set_override('inspection_callback_url', '', enforce_type=True)
+        wsgi_server = wsgi_server_cls.return_value
+        wsgi_server.start.side_effect = KeyboardInterrupt()
 
-        # Can look up network interfaces, but not IP.  Network interface not
-        # set, because no interface yields an IP.
-        mock_ifaces = [hardware.NetworkInterface('eth0', '00:00:00:00:00:00'),
-                       hardware.NetworkInterface('eth1', '00:00:00:00:00:01')]
-        mock_list_net.return_value = mock_ifaces
+        self.agent.hardware_initialization_delay = 10
+        self.agent.heartbeater = mock.Mock()
+        self.agent.api_client.lookup_node = mock.Mock()
+        self.agent.api_client.lookup_node.return_value = {
+            'node': {
+                'uuid': 'deadbeef-dabb-ad00-b105-f00d00bab10c'
+            },
+            'config': {
+                'heartbeat_timeout': 300
+            }
+        }
+        self.agent.run()
 
-        self.assertRaises(errors.LookupAgentIPError,
-                          homeless_agent.set_agent_advertise_addr)
-        self.assertEqual(6, mock_get_ipv4.call_count)
-        self.assertEqual(None, homeless_agent.network_interface)
+        listen_addr = ('192.0.2.1', 9999)
+        wsgi_server_cls.assert_called_once_with(
+            listen_addr[0],
+            listen_addr[1],
+            self.agent.api,
+            server_class=simple_server.WSGIServer)
+        wsgi_server.serve_forever.assert_called_once_with()
 
-        # First interface eth0 has no IP, second interface eth1 has an IP
-        mock_get_ipv4.side_effect = [None, '1.1.1.1']
-        homeless_agent.heartbeater.run()
-        self.assertEqual(('1.1.1.1', 9990), homeless_agent.advertise_address)
-        self.assertEqual('eth1', homeless_agent.network_interface)
+        self.agent.heartbeater.start.assert_called_once_with()
+        mocked_sleep.assert_called_once_with(10)
+        self.assertTrue(mock_check_for_iscsi.called)
 
     def test_async_command_success(self):
         result = base.AsyncCommandResult('foo_command', {'fail': False},
@@ -292,7 +321,7 @@ class TestBaseAgent(test_base.BaseTestCase):
             'command_result': None,
             'command_error': None,
         }
-        self.assertEqualEncoded(result, expected_result)
+        self.assertEqualEncoded(expected_result, result)
 
         result.start()
         result.join()
@@ -301,7 +330,7 @@ class TestBaseAgent(test_base.BaseTestCase):
         expected_result['command_result'] = {'result': ('foo_command: command '
                                                         'execution succeeded')}
 
-        self.assertEqualEncoded(result, expected_result)
+        self.assertEqualEncoded(expected_result, result)
 
     def test_async_command_failure(self):
         result = base.AsyncCommandResult('foo_command', {'fail': True},
@@ -316,7 +345,7 @@ class TestBaseAgent(test_base.BaseTestCase):
             'command_result': None,
             'command_error': None,
         }
-        self.assertEqualEncoded(result, expected_result)
+        self.assertEqualEncoded(expected_result, result)
 
         result.start()
         result.join()
@@ -325,7 +354,7 @@ class TestBaseAgent(test_base.BaseTestCase):
         expected_result['command_error'] = errors.CommandExecutionError(
             str(EXPECTED_ERROR))
 
-        self.assertEqualEncoded(result, expected_result)
+        self.assertEqualEncoded(expected_result, result)
 
     def test_get_node_uuid(self):
         self.agent.node = {'uuid': 'fake-node'}
@@ -341,6 +370,8 @@ class TestBaseAgent(test_base.BaseTestCase):
                           self.agent.get_node_uuid)
 
 
+@mock.patch.object(hardware.GenericHardwareManager, '_wait_for_disks',
+                   lambda self: None)
 class TestAgentStandalone(test_base.BaseTestCase):
 
     def setUp(self):
@@ -369,7 +400,9 @@ class TestAgentStandalone(test_base.BaseTestCase):
             'node': {
                 'uuid': 'deadbeef-dabb-ad00-b105-f00d00bab10c'
             },
-            'heartbeat_timeout': 300
+            'config': {
+                'heartbeat_timeout': 300
+            }
         }
         self.agent.run()
 
@@ -383,3 +416,133 @@ class TestAgentStandalone(test_base.BaseTestCase):
 
         self.assertFalse(self.agent.heartbeater.called)
         self.assertFalse(self.agent.api_client.lookup_node.called)
+
+
+@mock.patch.object(hardware, '_check_for_iscsi', lambda: None)
+@mock.patch.object(hardware.GenericHardwareManager, '_wait_for_disks',
+                   lambda self: None)
+@mock.patch.object(socket, 'gethostbyname', autospec=True)
+@mock.patch.object(utils, 'execute', autospec=True)
+class TestAdvertiseAddress(test_base.BaseTestCase):
+    def setUp(self):
+        super(TestAdvertiseAddress, self).setUp()
+
+        self.agent = agent.IronicPythonAgent(
+            api_url='https://fake_api.example.org:8081/',
+            advertise_address=(None, 9990),
+            listen_address=('0.0.0.0', 9999),
+            ip_lookup_attempts=5,
+            ip_lookup_sleep=10,
+            network_interface=None,
+            lookup_timeout=300,
+            lookup_interval=1,
+            driver_name='agent_ipmitool',
+            standalone=False)
+
+    def test_advertise_address_provided(self, mock_exec, mock_gethostbyname):
+        self.agent.advertise_address = ('1.2.3.4', 9990)
+
+        self.agent.set_agent_advertise_addr()
+
+        self.assertEqual(('1.2.3.4', 9990), self.agent.advertise_address)
+        self.assertFalse(mock_exec.called)
+        self.assertFalse(mock_gethostbyname.called)
+
+    @mock.patch.object(hardware.GenericHardwareManager, 'get_ipv4_addr',
+                       autospec=True)
+    def test_with_network_interface(self, mock_get_ipv4, mock_exec,
+                                    mock_gethostbyname):
+        self.agent.network_interface = 'em1'
+        mock_get_ipv4.return_value = '1.2.3.4'
+
+        self.agent.set_agent_advertise_addr()
+
+        self.assertEqual(('1.2.3.4', 9990), self.agent.advertise_address)
+        mock_get_ipv4.assert_called_once_with(mock.ANY, 'em1')
+        self.assertFalse(mock_exec.called)
+        self.assertFalse(mock_gethostbyname.called)
+
+    @mock.patch.object(hardware.GenericHardwareManager, 'get_ipv4_addr',
+                       autospec=True)
+    def test_with_network_interface_failed(self, mock_get_ipv4,
+                                           mock_exec,
+                                           mock_gethostbyname):
+        self.agent.network_interface = 'em1'
+        mock_get_ipv4.return_value = None
+
+        self.assertRaises(errors.LookupAgentIPError,
+                          self.agent.set_agent_advertise_addr)
+
+        mock_get_ipv4.assert_called_once_with(mock.ANY, 'em1')
+        self.assertFalse(mock_exec.called)
+        self.assertFalse(mock_gethostbyname.called)
+
+    def test_route_with_ip(self, mock_exec, mock_gethostbyname):
+        self.agent.api_url = 'http://1.2.1.2:8081/v1'
+        mock_gethostbyname.side_effect = socket.gaierror()
+        mock_exec.return_value = (
+            """1.2.1.2 via 192.168.122.1 dev eth0  src 192.168.122.56
+                cache """,
+            ""
+        )
+
+        self.agent.set_agent_advertise_addr()
+
+        self.assertEqual(('192.168.122.56', 9990),
+                         self.agent.advertise_address)
+        mock_exec.assert_called_once_with('ip', 'route', 'get', '1.2.1.2')
+        mock_gethostbyname.assert_called_once_with('1.2.1.2')
+
+    def test_route_with_host(self, mock_exec, mock_gethostbyname):
+        mock_gethostbyname.return_value = '1.2.1.2'
+        mock_exec.return_value = (
+            """1.2.1.2 via 192.168.122.1 dev eth0  src 192.168.122.56
+                cache """,
+            ""
+        )
+
+        self.agent.set_agent_advertise_addr()
+
+        self.assertEqual(('192.168.122.56', 9990),
+                         self.agent.advertise_address)
+        mock_exec.assert_called_once_with('ip', 'route', 'get', '1.2.1.2')
+        mock_gethostbyname.assert_called_once_with('fake_api.example.org')
+
+    @mock.patch.object(time, 'sleep', autospec=True)
+    def test_route_retry(self, mock_sleep, mock_exec, mock_gethostbyname):
+        mock_gethostbyname.return_value = '1.2.1.2'
+        mock_exec.side_effect = [
+            processutils.ProcessExecutionError('boom'),
+            (
+                "Error: some error text",
+                ""
+            ),
+            (
+                """1.2.1.2 via 192.168.122.1 dev eth0  src 192.168.122.56
+                    cache """,
+                ""
+            )
+        ]
+
+        self.agent.set_agent_advertise_addr()
+
+        self.assertEqual(('192.168.122.56', 9990),
+                         self.agent.advertise_address)
+        mock_exec.assert_called_with('ip', 'route', 'get', '1.2.1.2')
+        mock_gethostbyname.assert_called_once_with('fake_api.example.org')
+        mock_sleep.assert_called_with(10)
+        self.assertEqual(3, mock_exec.call_count)
+        self.assertEqual(2, mock_sleep.call_count)
+
+    @mock.patch.object(time, 'sleep', autospec=True)
+    def test_route_failed(self, mock_sleep, mock_exec, mock_gethostbyname):
+        mock_gethostbyname.return_value = '1.2.1.2'
+        mock_exec.side_effect = processutils.ProcessExecutionError('boom')
+
+        self.assertRaises(errors.LookupAgentIPError,
+                          self.agent.set_agent_advertise_addr)
+
+        mock_exec.assert_called_with('ip', 'route', 'get', '1.2.1.2')
+        mock_gethostbyname.assert_called_once_with('fake_api.example.org')
+        self.assertEqual(5, mock_exec.call_count)
+        self.assertEqual(5, mock_sleep.call_count)

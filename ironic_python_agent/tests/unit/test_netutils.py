@@ -15,6 +15,7 @@
 import binascii
 
 import mock
+from oslo_config import cfg
 from oslotest import base as test_base
 
 from ironic_python_agent import netutils
@@ -27,6 +28,8 @@ FAKE_LLDP_PACKET = binascii.unhexlify(
     '040d0545746865726e6574312f3138'
     '06020078'
 )
+
+cfg.CONF.import_opt('lldp_timeout', 'ironic_python_agent.config')
 
 
 class TestNetutils(test_base.BaseTestCase):
@@ -110,7 +113,8 @@ class TestNetutils(test_base.BaseTestCase):
         sock_mock.side_effect = [sock1, sock2]
 
         select_mock.side_effect = [
-            ([sock1, sock2], [], []),
+            ([sock1], [], []),
+            ([sock2], [], []),
         ]
 
         lldp_info = netutils.get_lldp_info(interface_names)
@@ -127,6 +131,12 @@ class TestNetutils(test_base.BaseTestCase):
 
         # 2 interfaces, 2 calls to enter promiscuous mode, 1 to leave
         self.assertEqual(6, fcntl_mock.call_count)
+
+        expected_calls = [
+            mock.call([sock1, sock2], [], [], cfg.CONF.lldp_timeout),
+            mock.call([sock2], [], [], cfg.CONF.lldp_timeout),
+        ]
+        self.assertEqual(expected_calls, select_mock.call_args_list)
 
     @mock.patch('fcntl.ioctl')
     @mock.patch('select.select')

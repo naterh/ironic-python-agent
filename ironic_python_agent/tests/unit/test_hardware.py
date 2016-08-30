@@ -12,24 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
+
+from ironic_lib import disk_utils
 import mock
 import netifaces
-import os
 from oslo_concurrency import processutils
+from oslo_config import cfg
 from oslo_utils import units
 from oslotest import base as test_base
 import pyudev
-import six
 from stevedore import extension
 
 from ironic_python_agent import errors
 from ironic_python_agent import hardware
 from ironic_python_agent import utils
 
-if six.PY2:
-    OPEN_FUNCTION_NAME = '__builtin__.open'
-else:
-    OPEN_FUNCTION_NAME = 'builtins.open'
+CONF = cfg.CONF
+
+CONF.import_opt('disk_wait_attempts', 'ironic_python_agent.config')
+CONF.import_opt('disk_wait_delay', 'ironic_python_agent.config')
 
 HDPARM_INFO_TEMPLATE = (
     '/dev/sda:\n'
@@ -149,7 +152,9 @@ BLK_DEVICE_TEMPLATE_SMALL_DEVICES = [
                          vendor="FooTastic"),
 ]
 
-SHRED_OUTPUT = (
+SHRED_OUTPUT_0_ITERATIONS_ZERO_FALSE = ()
+
+SHRED_OUTPUT_1_ITERATION_ZERO_TRUE = (
     'shred: /dev/sda: pass 1/2 (random)...\n'
     'shred: /dev/sda: pass 1/2 (random)...4.9GiB/29GiB 17%\n'
     'shred: /dev/sda: pass 1/2 (random)...15GiB/29GiB 51%\n'
@@ -160,6 +165,19 @@ SHRED_OUTPUT = (
     'shred: /dev/sda: pass 2/2 (000000)...15GiB/29GiB 51%\n'
     'shred: /dev/sda: pass 2/2 (000000)...20GiB/29GiB 69%\n'
     'shred: /dev/sda: pass 2/2 (000000)...29GiB/29GiB 100%\n'
+)
+
+SHRED_OUTPUT_2_ITERATIONS_ZERO_FALSE = (
+    'shred: /dev/sda: pass 1/2 (random)...\n'
+    'shred: /dev/sda: pass 1/2 (random)...4.9GiB/29GiB 17%\n'
+    'shred: /dev/sda: pass 1/2 (random)...15GiB/29GiB 51%\n'
+    'shred: /dev/sda: pass 1/2 (random)...20GiB/29GiB 69%\n'
+    'shred: /dev/sda: pass 1/2 (random)...29GiB/29GiB 100%\n'
+    'shred: /dev/sda: pass 2/2 (random)...\n'
+    'shred: /dev/sda: pass 2/2 (random)...4.9GiB/29GiB 17%\n'
+    'shred: /dev/sda: pass 2/2 (random)...15GiB/29GiB 51%\n'
+    'shred: /dev/sda: pass 2/2 (random)...20GiB/29GiB 69%\n'
+    'shred: /dev/sda: pass 2/2 (random)...29GiB/29GiB 100%\n'
 )
 
 
@@ -215,6 +233,11 @@ L3 cache:              15360K
 NUMA node0 CPU(s):     0-11
 """
 
+# NOTE(dtanstur): flags list stripped down for sanity reasons
+CPUINFO_FLAGS_OUTPUT = """
+flags           : fpu vme de pse
+"""
+
 
 class FakeHardwareManager(hardware.GenericHardwareManager):
     def __init__(self, hardware_support):
@@ -252,17 +275,40 @@ class TestHardwareManagerLoading(test_base.BaseTestCase):
         ])
 
 
+@mock.patch.object(hardware, '_udev_settle', lambda *_: None)
 class TestGenericHardwareManager(test_base.BaseTestCase):
     def setUp(self):
         super(TestGenericHardwareManager, self).setUp()
         self.hardware = hardware.GenericHardwareManager()
         self.node = {'uuid': 'dda135fb-732d-4742-8e72-df8f3199d244',
                      'driver_internal_info': {}}
+        CONF.clear_override('disk_wait_attempts')
+        CONF.clear_override('disk_wait_delay')
+
+    def test_get_clean_steps(self):
+        expected_clean_steps = [
+            {
+                'step': 'erase_devices',
+                'priority': 10,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'erase_devices_metadata',
+                'priority': 99,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            }
+        ]
+        clean_steps = self.hardware.get_clean_steps(self.node, [])
+        self.assertEqual(expected_clean_steps, clean_steps)
 
     @mock.patch('netifaces.ifaddresses')
     @mock.patch('os.listdir')
     @mock.patch('os.path.exists')
-    @mock.patch(OPEN_FUNCTION_NAME)
+    @mock.patch('six.moves.builtins.open')
     def test_list_network_interfaces(self,
                                      mocked_open,
                                      mocked_exists,
@@ -273,27 +319,128 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
         mocked_open.return_value.__enter__ = lambda s: s
         mocked_open.return_value.__exit__ = mock.Mock()
         read_mock = mocked_open.return_value.read
-        read_mock.return_value = '00:0c:29:8c:11:b1\n'
+        read_mock.side_effect = ['00:0c:29:8c:11:b1\n', '1']
         mocked_ifaddresses.return_value = {
             netifaces.AF_INET: [{'addr': '192.168.1.2'}]
         }
         interfaces = self.hardware.list_network_interfaces()
-        self.assertEqual(len(interfaces), 1)
-        self.assertEqual(interfaces[0].name, 'eth0')
-        self.assertEqual(interfaces[0].mac_address, '00:0c:29:8c:11:b1')
-        self.assertEqual(interfaces[0].ipv4_address, '192.168.1.2')
+        self.assertEqual(1, len(interfaces))
+        self.assertEqual('eth0', interfaces[0].name)
+        self.assertEqual('00:0c:29:8c:11:b1', interfaces[0].mac_address)
+        self.assertEqual('192.168.1.2', interfaces[0].ipv4_address)
+        self.assertIsNone(interfaces[0].lldp)
+        self.assertTrue(interfaces[0].has_carrier)
 
+    @mock.patch('ironic_python_agent.netutils.get_lldp_info')
+    @mock.patch('netifaces.ifaddresses')
+    @mock.patch('os.listdir')
+    @mock.patch('os.path.exists')
+    @mock.patch('six.moves.builtins.open')
+    def test_list_network_interfaces_with_lldp(self,
+                                               mocked_open,
+                                               mocked_exists,
+                                               mocked_listdir,
+                                               mocked_ifaddresses,
+                                               mocked_lldp_info):
+        CONF.set_override('collect_lldp', True)
+        mocked_listdir.return_value = ['lo', 'eth0']
+        mocked_exists.side_effect = [False, True]
+        mocked_open.return_value.__enter__ = lambda s: s
+        mocked_open.return_value.__exit__ = mock.Mock()
+        read_mock = mocked_open.return_value.read
+        read_mock.side_effect = ['00:0c:29:8c:11:b1\n', '1']
+        mocked_ifaddresses.return_value = {
+            netifaces.AF_INET: [{'addr': '192.168.1.2'}]
+        }
+        mocked_lldp_info.return_value = {'eth0': [
+            (0, b''),
+            (1, b'\x04\x88Z\x92\xecTY'),
+            (2, b'\x05Ethernet1/18'),
+            (3, b'\x00x')]
+        }
+        interfaces = self.hardware.list_network_interfaces()
+        self.assertEqual(1, len(interfaces))
+        self.assertEqual('eth0', interfaces[0].name)
+        self.assertEqual('00:0c:29:8c:11:b1', interfaces[0].mac_address)
+        self.assertEqual('192.168.1.2', interfaces[0].ipv4_address)
+        expected_lldp_info = [
+            (0, ''),
+            (1, '04885a92ec5459'),
+            (2, '0545746865726e6574312f3138'),
+            (3, '0078'),
+        ]
+        self.assertEqual(expected_lldp_info, interfaces[0].lldp)
+        self.assertTrue(interfaces[0].has_carrier)
+
+    @mock.patch('ironic_python_agent.netutils.get_lldp_info')
+    @mock.patch('netifaces.ifaddresses')
+    @mock.patch('os.listdir')
+    @mock.patch('os.path.exists')
+    @mock.patch('six.moves.builtins.open')
+    def test_list_network_interfaces_with_lldp_error(
+            self, mocked_open, mocked_exists, mocked_listdir,
+            mocked_ifaddresses, mocked_lldp_info):
+        CONF.set_override('collect_lldp', True)
+        mocked_listdir.return_value = ['lo', 'eth0']
+        mocked_exists.side_effect = [False, True]
+        mocked_open.return_value.__enter__ = lambda s: s
+        mocked_open.return_value.__exit__ = mock.Mock()
+        read_mock = mocked_open.return_value.read
+        read_mock.side_effect = ['00:0c:29:8c:11:b1\n', '1']
+        mocked_ifaddresses.return_value = {
+            netifaces.AF_INET: [{'addr': '192.168.1.2'}]
+        }
+        mocked_lldp_info.side_effect = Exception('Boom!')
+        interfaces = self.hardware.list_network_interfaces()
+        self.assertEqual(1, len(interfaces))
+        self.assertEqual('eth0', interfaces[0].name)
+        self.assertEqual('00:0c:29:8c:11:b1', interfaces[0].mac_address)
+        self.assertEqual('192.168.1.2', interfaces[0].ipv4_address)
+        self.assertIsNone(interfaces[0].lldp)
+        self.assertTrue(interfaces[0].has_carrier)
+
+    @mock.patch('netifaces.ifaddresses')
+    @mock.patch('os.listdir')
+    @mock.patch('os.path.exists')
+    @mock.patch('six.moves.builtins.open')
+    def test_list_network_interfaces_no_carrier(self,
+                                                mocked_open,
+                                                mocked_exists,
+                                                mocked_listdir,
+                                                mocked_ifaddresses):
+        mocked_listdir.return_value = ['lo', 'eth0']
+        mocked_exists.side_effect = [False, True]
+        mocked_open.return_value.__enter__ = lambda s: s
+        mocked_open.return_value.__exit__ = mock.Mock()
+        read_mock = mocked_open.return_value.read
+        read_mock.side_effect = ['00:0c:29:8c:11:b1\n', OSError('boom')]
+        mocked_ifaddresses.return_value = {
+            netifaces.AF_INET: [{'addr': '192.168.1.2'}]
+        }
+        interfaces = self.hardware.list_network_interfaces()
+        self.assertEqual(1, len(interfaces))
+        self.assertEqual('eth0', interfaces[0].name)
+        self.assertEqual('00:0c:29:8c:11:b1', interfaces[0].mac_address)
+        self.assertEqual('192.168.1.2', interfaces[0].ipv4_address)
+        self.assertFalse(interfaces[0].has_carrier)
+
+    @mock.patch.object(hardware, 'get_cached_node')
     @mock.patch.object(utils, 'execute')
-    def test_get_os_install_device(self, mocked_execute):
+    def test_get_os_install_device(self, mocked_execute, mock_cached_node):
+        mock_cached_node.return_value = None
         mocked_execute.return_value = (BLK_DEVICE_TEMPLATE, '')
-        self.assertEqual(self.hardware.get_os_install_device(), '/dev/sdb')
+        self.assertEqual('/dev/sdb', self.hardware.get_os_install_device())
         mocked_execute.assert_called_once_with(
             'lsblk', '-Pbdi', '-oKNAME,MODEL,SIZE,ROTA,TYPE',
             check_exit_code=[0])
+        mock_cached_node.assert_called_once_with()
 
+    @mock.patch.object(hardware, 'get_cached_node')
     @mock.patch.object(utils, 'execute')
-    def test_get_os_install_device_fails(self, mocked_execute):
+    def test_get_os_install_device_fails(self, mocked_execute,
+                                         mock_cached_node):
         """Fail to find device >=4GB w/o root device hints"""
+        mock_cached_node.return_value = None
         mocked_execute.return_value = (BLK_DEVICE_TEMPLATE_SMALL, '')
         ex = self.assertRaises(errors.DeviceNotFound,
                                self.hardware.get_os_install_device)
@@ -301,17 +448,14 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
             'lsblk', '-Pbdi', '-oKNAME,MODEL,SIZE,ROTA,TYPE',
             check_exit_code=[0])
         self.assertIn(str(4 * units.Gi), ex.details)
+        mock_cached_node.assert_called_once_with()
 
     @mock.patch.object(hardware, 'list_all_block_devices')
-    @mock.patch.object(utils, 'parse_root_device_hints')
-    def test_get_os_install_device_root_device_hints(self, mock_root_device,
-                                                     mock_dev):
+    @mock.patch.object(hardware, 'get_cached_node')
+    def _get_os_install_device_root_device_hints(self, hints, expected_device,
+                                                 mock_cached_node, mock_dev):
+        mock_cached_node.return_value = {'properties': {'root_device': hints}}
         model = 'fastable sd131 7'
-        mock_root_device.return_value = {'model': model,
-                                         'wwn': 'fake-wwn',
-                                         'serial': 'fake-serial',
-                                         'vendor': 'fake-vendor',
-                                         'size': 10}
         mock_dev.return_value = [
             hardware.BlockDevice(name='/dev/sda',
                                  model='TinyUSB Drive',
@@ -325,7 +469,7 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
             hardware.BlockDevice(name='/dev/sdb',
                                  model=model,
                                  size=10737418240,
-                                 rotational=False,
+                                 rotational=True,
                                  vendor='fake-vendor',
                                  wwn='fake-wwn',
                                  wwn_with_extension='fake-wwnven0',
@@ -333,20 +477,65 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
                                  serial='fake-serial'),
         ]
 
-        self.assertEqual('/dev/sdb', self.hardware.get_os_install_device())
-        mock_root_device.assert_called_once_with()
+        self.assertEqual(expected_device,
+                         self.hardware.get_os_install_device())
+        mock_cached_node.assert_called_once_with()
         mock_dev.assert_called_once_with()
 
+    def test_get_os_install_device_root_device_hints_model(self):
+        self._get_os_install_device_root_device_hints(
+            {'model': 'fastable sd131 7'}, '/dev/sdb')
+
+    def test_get_os_install_device_root_device_hints_wwn(self):
+        self._get_os_install_device_root_device_hints(
+            {'wwn': 'wwn0'}, '/dev/sda')
+
+    def test_get_os_install_device_root_device_hints_serial(self):
+        self._get_os_install_device_root_device_hints(
+            {'serial': 'serial0'}, '/dev/sda')
+
+    def test_get_os_install_device_root_device_hints_size(self):
+        self._get_os_install_device_root_device_hints(
+            {'size': 10}, '/dev/sdb')
+
+    def test_get_os_install_device_root_device_hints_size_str(self):
+        self._get_os_install_device_root_device_hints(
+            {'size': '10'}, '/dev/sdb')
+
+    @mock.patch.object(hardware.LOG, 'warning')
+    def test_get_os_install_device_root_device_hints_size_not_int(
+            self, mock_log):
+        self.assertRaises(errors.DeviceNotFound,
+                          self._get_os_install_device_root_device_hints,
+                          {'size': 'not-int'}, '/dev/sdb')
+        self.assertTrue(mock_log.called)
+
+    def test_get_os_install_device_root_device_hints_vendor(self):
+        self._get_os_install_device_root_device_hints(
+            {'vendor': 'fake-vendor'}, '/dev/sdb')
+
+    def test_get_os_install_device_root_device_hints_name(self):
+        self._get_os_install_device_root_device_hints(
+            {'name': '/dev/sdb'}, '/dev/sdb')
+
+    def test_get_os_install_device_root_device_hints_rotational(self):
+        for value in (True, 'true', 'on', 'y', 'yes'):
+            self._get_os_install_device_root_device_hints(
+                {'rotational': value}, '/dev/sdb')
+
     @mock.patch.object(hardware, 'list_all_block_devices')
-    @mock.patch.object(utils, 'parse_root_device_hints')
+    @mock.patch.object(hardware, 'get_cached_node')
     def test_get_os_install_device_root_device_hints_no_device_found(
-            self, mock_root_device, mock_dev):
+            self, mock_cached_node, mock_dev):
         model = 'fastable sd131 7'
-        mock_root_device.return_value = {'model': model,
-                                         'wwn': 'fake-wwn',
-                                         'serial': 'fake-serial',
-                                         'vendor': 'fake-vendor',
-                                         'size': 10}
+        mock_cached_node.return_value = {
+            'properties': {
+                'root_device': {
+                    'model': model,
+                    'wwn': 'fake-wwn',
+                    'serial': 'fake-serial',
+                    'vendor': 'fake-vendor',
+                    'size': 10}}}
         # Model is different here
         mock_dev.return_value = [
             hardware.BlockDevice(name='/dev/sda',
@@ -366,12 +555,13 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
         ]
         self.assertRaises(errors.DeviceNotFound,
                           self.hardware.get_os_install_device)
-        mock_root_device.assert_called_once_with()
+        mock_cached_node.assert_called_once_with()
         mock_dev.assert_called_once_with()
 
     def test__get_device_vendor(self):
         fileobj = mock.mock_open(read_data='fake-vendor')
-        with mock.patch(OPEN_FUNCTION_NAME, fileobj, create=True) as mock_open:
+        with mock.patch(
+                'six.moves.builtins.open', fileobj, create=True) as mock_open:
             vendor = hardware._get_device_vendor('/dev/sdfake')
             mock_open.assert_called_once_with(
                 '/sys/class/block/sdfake/device/vendor', 'r')
@@ -379,25 +569,63 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
 
     @mock.patch.object(utils, 'execute')
     def test_get_cpus(self, mocked_execute):
-        mocked_execute.return_value = LSCPU_OUTPUT, ''
+        mocked_execute.side_effect = [
+            (LSCPU_OUTPUT, ''),
+            (CPUINFO_FLAGS_OUTPUT, '')
+        ]
 
         cpus = self.hardware.get_cpus()
-        self.assertEqual(cpus.model_name,
-                         'Intel(R) Xeon(R) CPU E5-2609 0 @ 2.40GHz')
-        self.assertEqual(cpus.frequency, '2400.0000')
-        self.assertEqual(cpus.count, 4)
-        self.assertEqual(cpus.architecture, 'x86_64')
+        self.assertEqual('Intel(R) Xeon(R) CPU E5-2609 0 @ 2.40GHz',
+                         cpus.model_name)
+        self.assertEqual('2400.0000', cpus.frequency)
+        self.assertEqual(4, cpus.count)
+        self.assertEqual('x86_64', cpus.architecture)
+        self.assertEqual(['fpu', 'vme', 'de', 'pse'], cpus.flags)
 
     @mock.patch.object(utils, 'execute')
     def test_get_cpus2(self, mocked_execute):
-        mocked_execute.return_value = LSCPU_OUTPUT_NO_MAX_MHZ, ''
+        mocked_execute.side_effect = [
+            (LSCPU_OUTPUT_NO_MAX_MHZ, ''),
+            (CPUINFO_FLAGS_OUTPUT, '')
+        ]
 
         cpus = self.hardware.get_cpus()
-        self.assertEqual(cpus.model_name,
-                         'Intel(R) Xeon(R) CPU E5-1650 v3 @ 3.50GHz')
-        self.assertEqual(cpus.frequency, '1794.433')
-        self.assertEqual(cpus.count, 12)
-        self.assertEqual(cpus.architecture, 'x86_64')
+        self.assertEqual('Intel(R) Xeon(R) CPU E5-1650 v3 @ 3.50GHz',
+                         cpus.model_name)
+        self.assertEqual('1794.433', cpus.frequency)
+        self.assertEqual(12, cpus.count)
+        self.assertEqual('x86_64', cpus.architecture)
+        self.assertEqual(['fpu', 'vme', 'de', 'pse'], cpus.flags)
+
+    @mock.patch.object(utils, 'execute')
+    def test_get_cpus_no_flags(self, mocked_execute):
+        mocked_execute.side_effect = [
+            (LSCPU_OUTPUT, ''),
+            processutils.ProcessExecutionError()
+        ]
+
+        cpus = self.hardware.get_cpus()
+        self.assertEqual('Intel(R) Xeon(R) CPU E5-2609 0 @ 2.40GHz',
+                         cpus.model_name)
+        self.assertEqual('2400.0000', cpus.frequency)
+        self.assertEqual(4, cpus.count)
+        self.assertEqual('x86_64', cpus.architecture)
+        self.assertEqual([], cpus.flags)
+
+    @mock.patch.object(utils, 'execute')
+    def test_get_cpus_illegal_flags(self, mocked_execute):
+        mocked_execute.side_effect = [
+            (LSCPU_OUTPUT, ''),
+            ('I am not a flag', '')
+        ]
+
+        cpus = self.hardware.get_cpus()
+        self.assertEqual('Intel(R) Xeon(R) CPU E5-2609 0 @ 2.40GHz',
+                         cpus.model_name)
+        self.assertEqual('2400.0000', cpus.frequency)
+        self.assertEqual(4, cpus.count)
+        self.assertEqual('x86_64', cpus.architecture)
+        self.assertEqual([], cpus.flags)
 
     @mock.patch('psutil.version_info', (2, 0))
     @mock.patch('psutil.phymem_usage', autospec=True)
@@ -405,14 +633,17 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
     def test_get_memory(self, mocked_execute, mocked_usage):
         mocked_usage.return_value = mock.Mock(total=3952 * 1024 * 1024)
         mocked_execute.return_value = (
-            "Foo\nSize: 2048 MB\nSize: 2 GB\n",
+            ("Foo\nSize: 2048 MB\nSize: 2 GB\n"
+             "Installed Size: Not Installed\n"
+             "Enabled Size: Not Installed\n"
+             "Size: No Module Installed\n"),
             ""
         )
 
         mem = self.hardware.get_memory()
 
-        self.assertEqual(mem.total, 3952 * 1024 * 1024)
-        self.assertEqual(mem.physical_mb, 4096)
+        self.assertEqual(3952 * 1024 * 1024, mem.total)
+        self.assertEqual(4096, mem.physical_mb)
 
     def test_list_hardware_info(self):
         self.hardware.list_network_interfaces = mock.Mock()
@@ -437,13 +668,19 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
             hardware.BlockDevice('/dev/hdaa', 'small', 65535, False),
         ]
 
+        self.hardware.get_boot_info = mock.Mock()
+        self.hardware.get_boot_info.return_value = hardware.BootInfo(
+            current_boot_mode='bios', pxe_interface='boot:if')
+
         hardware_info = self.hardware.list_hardware_info()
-        self.assertEqual(hardware_info['memory'], self.hardware.get_memory())
-        self.assertEqual(hardware_info['cpu'], self.hardware.get_cpus())
-        self.assertEqual(hardware_info['disks'],
-                         self.hardware.list_block_devices())
-        self.assertEqual(hardware_info['interfaces'],
-                         self.hardware.list_network_interfaces())
+        self.assertEqual(self.hardware.get_memory(), hardware_info['memory'])
+        self.assertEqual(self.hardware.get_cpus(), hardware_info['cpu'])
+        self.assertEqual(self.hardware.list_block_devices(),
+                         hardware_info['disks'])
+        self.assertEqual(self.hardware.list_network_interfaces(),
+                         hardware_info['interfaces'])
+        self.assertEqual(self.hardware.get_boot_info(),
+                         hardware_info['boot'])
 
     @mock.patch.object(hardware, 'list_all_block_devices')
     def test_list_block_devices(self, list_mock):
@@ -587,17 +824,15 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
 
     @mock.patch.object(utils, 'execute')
     def test_erase_block_device_ata_success(self, mocked_execute):
-        hdparm_info_fields = {
-            'supported': '\tsupported',
-            'enabled': 'not\tenabled',
-            'frozen': 'not\tfrozen',
-            'enhanced_erase': 'not\tsupported: enhanced erase',
-        }
         mocked_execute.side_effect = [
-            (HDPARM_INFO_TEMPLATE % hdparm_info_fields, ''),
+            (create_hdparm_info(
+                supported=True, enabled=False, frozen=False,
+                enhanced_erase=False), ''),
             ('', ''),
             ('', ''),
-            (HDPARM_INFO_TEMPLATE % hdparm_info_fields, ''),
+            (create_hdparm_info(
+                supported=True, enabled=False, frozen=False,
+                enhanced_erase=False), ''),
         ]
 
         block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
@@ -615,35 +850,10 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
     @mock.patch.object(utils, 'execute')
     def test_erase_block_device_nosecurity_shred(self, mocked_execute):
         hdparm_output = HDPARM_INFO_TEMPLATE.split('\nSecurity:')[0]
-        info = self.node.get('driver_internal_info')
-        info['agent_erase_devices_iterations'] = 2
 
         mocked_execute.side_effect = [
             (hdparm_output, ''),
-            (SHRED_OUTPUT, '')
-        ]
-
-        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
-                                            True)
-        self.hardware.erase_block_device(self.node, block_device)
-        mocked_execute.assert_has_calls([
-            mock.call('hdparm', '-I', '/dev/sda'),
-            mock.call('shred', '--force', '--zero', '--verbose',
-                      '--iterations', '2', '/dev/sda')
-        ])
-
-    @mock.patch.object(utils, 'execute')
-    def test_erase_block_device_notsupported_shred(self, mocked_execute):
-        hdparm_output = HDPARM_INFO_TEMPLATE % {
-            'supported': 'not\tsupported',
-            'enabled': 'not\tenabled',
-            'frozen': 'not\tfrozen',
-            'enhanced_erase': 'not\tsupported: enhanced erase',
-        }
-
-        mocked_execute.side_effect = [
-            (hdparm_output, ''),
-            (SHRED_OUTPUT, '')
+            (SHRED_OUTPUT_1_ITERATION_ZERO_TRUE, '')
         ]
 
         block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
@@ -653,6 +863,71 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
             mock.call('hdparm', '-I', '/dev/sda'),
             mock.call('shred', '--force', '--zero', '--verbose',
                       '--iterations', '1', '/dev/sda')
+        ])
+
+    @mock.patch.object(utils, 'execute')
+    def test_erase_block_device_notsupported_shred(self, mocked_execute):
+        hdparm_output = create_hdparm_info(
+            supported=False, enabled=False, frozen=False, enhanced_erase=False)
+
+        mocked_execute.side_effect = [
+            (hdparm_output, ''),
+            (SHRED_OUTPUT_1_ITERATION_ZERO_TRUE, '')
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+        self.hardware.erase_block_device(self.node, block_device)
+        mocked_execute.assert_has_calls([
+            mock.call('hdparm', '-I', '/dev/sda'),
+            mock.call('shred', '--force', '--zero', '--verbose',
+                      '--iterations', '1', '/dev/sda')
+        ])
+
+    @mock.patch.object(utils, 'execute')
+    def test_erase_block_device_shred_uses_internal_info(self, mocked_execute):
+        hdparm_output = create_hdparm_info(
+            supported=False, enabled=False, frozen=False, enhanced_erase=False)
+
+        info = self.node['driver_internal_info']
+        info['agent_erase_devices_iterations'] = 2
+        info['agent_erase_devices_zeroize'] = False
+
+        mocked_execute.side_effect = [
+            (hdparm_output, ''),
+            (SHRED_OUTPUT_2_ITERATIONS_ZERO_FALSE, '')
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+        self.hardware.erase_block_device(self.node, block_device)
+        mocked_execute.assert_has_calls([
+            mock.call('hdparm', '-I', '/dev/sda'),
+            mock.call('shred', '--force', '--verbose',
+                      '--iterations', '2', '/dev/sda')
+        ])
+
+    @mock.patch.object(utils, 'execute')
+    def test_erase_block_device_shred_0_pass_no_zeroize(self, mocked_execute):
+        hdparm_output = create_hdparm_info(
+            supported=False, enabled=False, frozen=False, enhanced_erase=False)
+
+        info = self.node['driver_internal_info']
+        info['agent_erase_devices_iterations'] = 0
+        info['agent_erase_devices_zeroize'] = False
+
+        mocked_execute.side_effect = [
+            (hdparm_output, ''),
+            (SHRED_OUTPUT_0_ITERATIONS_ZERO_FALSE, '')
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+        self.hardware.erase_block_device(self.node, block_device)
+        mocked_execute.assert_has_calls([
+            mock.call('hdparm', '-I', '/dev/sda'),
+            mock.call('shred', '--force', '--verbose',
+                      '--iterations', '0', '/dev/sda')
         ])
 
     @mock.patch.object(hardware.GenericHardwareManager,
@@ -724,14 +999,122 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
             'shred', '--force', '--zero', '--verbose', '--iterations', '1',
             '/dev/sda')
 
+    @mock.patch.object(hardware.GenericHardwareManager, '_shred_block_device')
     @mock.patch.object(utils, 'execute')
-    def test_erase_block_device_ata_security_enabled(self, mocked_execute):
-        hdparm_output = HDPARM_INFO_TEMPLATE % {
-            'supported': '\tsupported',
-            'enabled': '\tenabled',
-            'frozen': 'not\tfrozen',
-            'enhanced_erase': 'not\tsupported: enhanced erase',
-        }
+    def test_erase_block_device_ata_security_enabled(
+            self, mocked_execute, mock_shred):
+        hdparm_output = create_hdparm_info(
+            supported=True, enabled=True, frozen=False, enhanced_erase=False)
+
+        mocked_execute.side_effect = [
+            (hdparm_output, ''),
+            None,
+            (hdparm_output, '')
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+
+        self.assertRaises(
+            errors.IncompatibleHardwareMethodError,
+            self.hardware.erase_block_device,
+            self.node,
+            block_device)
+        self.assertFalse(mock_shred.called)
+
+    @mock.patch.object(hardware.GenericHardwareManager, '_shred_block_device')
+    @mock.patch.object(utils, 'execute')
+    def test_erase_block_device_ata_security_enabled_unlock_attempt(
+            self, mocked_execute, mock_shred):
+        hdparm_output = create_hdparm_info(
+            supported=True, enabled=True, frozen=False, enhanced_erase=False)
+        hdparm_output_not_enabled = create_hdparm_info(
+            supported=True, enabled=False, frozen=False, enhanced_erase=False)
+
+        mocked_execute.side_effect = [
+            (hdparm_output, ''),
+            '',
+            (hdparm_output_not_enabled, ''),
+            '',
+            '',
+            (hdparm_output_not_enabled, '')
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+
+        self.hardware.erase_block_device(self.node, block_device)
+        self.assertFalse(mock_shred.called)
+
+    @mock.patch.object(utils, 'execute')
+    def test__ata_erase_security_enabled_unlock_exception(
+            self, mocked_execute):
+        hdparm_output = create_hdparm_info(
+            supported=True, enabled=True, frozen=False, enhanced_erase=False)
+
+        mocked_execute.side_effect = [
+            (hdparm_output, ''),
+            processutils.ProcessExecutionError()
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+
+        self.assertRaises(errors.BlockDeviceEraseError,
+                          self.hardware._ata_erase,
+                          block_device)
+
+    @mock.patch.object(utils, 'execute')
+    def test__ata_erase_security_enabled_set_password_exception(
+            self, mocked_execute):
+        hdparm_output = create_hdparm_info(
+            supported=True, enabled=True, frozen=False, enhanced_erase=False)
+        hdparm_output_not_enabled = create_hdparm_info(
+            supported=True, enabled=False, frozen=False, enhanced_erase=False)
+
+        mocked_execute.side_effect = [
+            (hdparm_output, ''),
+            '',
+            (hdparm_output_not_enabled, ''),
+            '',
+            processutils.ProcessExecutionError()
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+
+        self.assertRaises(errors.BlockDeviceEraseError,
+                          self.hardware._ata_erase,
+                          block_device)
+
+    @mock.patch.object(utils, 'execute')
+    def test__ata_erase_security_erase_exec_exception(
+            self, mocked_execute):
+        hdparm_output = create_hdparm_info(
+            supported=True, enabled=True, frozen=False, enhanced_erase=False)
+        hdparm_output_not_enabled = create_hdparm_info(
+            supported=True, enabled=False, frozen=False, enhanced_erase=False)
+
+        mocked_execute.side_effect = [
+            (hdparm_output, '', '-1'),
+            '',
+            (hdparm_output_not_enabled, ''),
+            '',
+            processutils.ProcessExecutionError()
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+
+        self.assertRaises(errors.BlockDeviceEraseError,
+                          self.hardware._ata_erase,
+                          block_device)
+
+    @mock.patch.object(hardware.GenericHardwareManager, '_shred_block_device')
+    @mock.patch.object(utils, 'execute')
+    def test_erase_block_device_ata_frozen(self, mocked_execute, mock_shred):
+        hdparm_output = create_hdparm_info(
+            supported=True, enabled=False, frozen=True, enhanced_erase=False)
 
         mocked_execute.side_effect = [
             (hdparm_output, '')
@@ -739,46 +1122,23 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
 
         block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
                                             True)
-        self.assertRaises(errors.BlockDeviceEraseError,
-                          self.hardware.erase_block_device,
-                          self.node, block_device)
+        self.assertRaises(
+            errors.IncompatibleHardwareMethodError,
+            self.hardware.erase_block_device,
+            self.node,
+            block_device)
+        self.assertFalse(mock_shred.called)
 
+    @mock.patch.object(hardware.GenericHardwareManager, '_shred_block_device')
     @mock.patch.object(utils, 'execute')
-    def test_erase_block_device_ata_frozen(self, mocked_execute):
-        hdparm_output = HDPARM_INFO_TEMPLATE % {
-            'supported': '\tsupported',
-            'enabled': 'not\tenabled',
-            'frozen': '\tfrozen',
-            'enhanced_erase': 'not\tsupported: enhanced erase',
-        }
+    def test_erase_block_device_ata_failed(self, mocked_execute, mock_shred):
+        hdparm_output_before = create_hdparm_info(
+            supported=True, enabled=False, frozen=False, enhanced_erase=False)
 
-        mocked_execute.side_effect = [
-            (hdparm_output, '')
-        ]
-
-        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
-                                            True)
-        self.assertRaises(errors.BlockDeviceEraseError,
-                          self.hardware.erase_block_device,
-                          self.node, block_device)
-
-    @mock.patch.object(utils, 'execute')
-    def test_erase_block_device_ata_failed(self, mocked_execute):
-        hdparm_output_before = HDPARM_INFO_TEMPLATE % {
-            'supported': '\tsupported',
-            'enabled': 'not\tenabled',
-            'frozen': 'not\tfrozen',
-            'enhanced_erase': 'not\tsupported: enhanced erase',
-        }
-
-        # If security mode remains enabled after the erase, it is indiciative
+        # If security mode remains enabled after the erase, it is indicative
         # of a failed erase.
-        hdparm_output_after = HDPARM_INFO_TEMPLATE % {
-            'supported': '\tsupported',
-            'enabled': '\tenabled',
-            'frozen': 'not\tfrozen',
-            'enhanced_erase': 'not\tsupported: enhanced erase',
-        }
+        hdparm_output_after = create_hdparm_info(
+            supported=True, enabled=True, frozen=False, enhanced_erase=False)
 
         mocked_execute.side_effect = [
             (hdparm_output_before, ''),
@@ -789,27 +1149,58 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
 
         block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
                                             True)
-        self.assertRaises(errors.BlockDeviceEraseError,
-                          self.hardware.erase_block_device,
-                          self.node, block_device)
+
+        self.assertRaises(
+            errors.IncompatibleHardwareMethodError,
+            self.hardware.erase_block_device,
+            self.node,
+            block_device)
+        self.assertFalse(mock_shred.called)
+
+    @mock.patch.object(hardware.GenericHardwareManager, '_shred_block_device')
+    @mock.patch.object(utils, 'execute')
+    def test_erase_block_device_ata_failed_continued(
+            self, mocked_execute, mock_shred):
+
+        info = self.node['driver_internal_info']
+        info['agent_continue_if_ata_erase_failed'] = True
+
+        hdparm_output_before = create_hdparm_info(
+            supported=True, enabled=False, frozen=False, enhanced_erase=False)
+
+        # If security mode remains enabled after the erase, it is indicative
+        # of a failed erase.
+        hdparm_output_after = create_hdparm_info(
+            supported=True, enabled=True, frozen=False, enhanced_erase=False)
+
+        mocked_execute.side_effect = [
+            (hdparm_output_before, ''),
+            ('', ''),
+            ('', ''),
+            (hdparm_output_after, ''),
+        ]
+
+        block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
+                                            True)
+
+        self.hardware.erase_block_device(self.node, block_device)
+        self.assertTrue(mock_shred.called)
 
     def test_normal_vs_enhanced_security_erase(self):
         @mock.patch.object(utils, 'execute')
         def test_security_erase_option(test_case,
-                                       enhanced_erase_string,
+                                       enhanced_erase,
                                        expected_option,
                                        mocked_execute):
-            hdparm_parameters = {
-                'supported': '\tsupported',
-                'enabled': 'not\tenabled',
-                'frozen': 'not\tfrozen',
-                'enhanced_erase': enhanced_erase_string,
-            }
             mocked_execute.side_effect = [
-                (HDPARM_INFO_TEMPLATE % hdparm_parameters, ''),
+                (create_hdparm_info(
+                    supported=True, enabled=False, frozen=False,
+                    enhanced_erase=enhanced_erase), ''),
                 ('', ''),
                 ('', ''),
-                (HDPARM_INFO_TEMPLATE % hdparm_parameters, ''),
+                (create_hdparm_info(
+                    supported=True, enabled=False, frozen=False,
+                    enhanced_erase=enhanced_erase), ''),
             ]
 
             block_device = hardware.BlockDevice('/dev/sda', 'big', 1073741824,
@@ -820,9 +1211,67 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
                                            'NULL', '/dev/sda')
 
         test_security_erase_option(
-            self, '\tsupported: enhanced erase', '--security-erase-enhanced')
+            self, True, '--security-erase-enhanced')
         test_security_erase_option(
-            self, '\tnot\tsupported: enhanced erase', '--security-erase')
+            self, False, '--security-erase')
+
+    @mock.patch.object(hardware.GenericHardwareManager,
+                       '_is_virtual_media_device', autospec=True)
+    @mock.patch.object(hardware.GenericHardwareManager,
+                       'list_block_devices', autospec=True)
+    @mock.patch.object(disk_utils, 'destroy_disk_metadata', autospec=True)
+    def test_erase_devices_metadata(
+            self, mock_metadata, mock_list_devs, mock__is_vmedia):
+        block_devices = [
+            hardware.BlockDevice('/dev/sr0', 'vmedia', 12345, True),
+            hardware.BlockDevice('/dev/sda', 'small', 65535, False),
+        ]
+        mock_list_devs.return_value = block_devices
+        mock__is_vmedia.side_effect = (True, False)
+
+        self.hardware.erase_devices_metadata(self.node, [])
+        mock_metadata.assert_called_once_with(
+            '/dev/sda', self.node['uuid'])
+        mock_list_devs.assert_called_once_with(mock.ANY)
+        mock__is_vmedia.assert_has_calls([
+            mock.call(mock.ANY, block_devices[0]),
+            mock.call(mock.ANY, block_devices[1])
+        ])
+
+    @mock.patch.object(hardware.GenericHardwareManager,
+                       '_is_virtual_media_device', autospec=True)
+    @mock.patch.object(hardware.GenericHardwareManager,
+                       'list_block_devices', autospec=True)
+    @mock.patch.object(disk_utils, 'destroy_disk_metadata', autospec=True)
+    def test_erase_devices_metadata_error(
+            self, mock_metadata, mock_list_devs, mock__is_vmedia):
+        block_devices = [
+            hardware.BlockDevice('/dev/sda', 'small', 65535, False),
+            hardware.BlockDevice('/dev/sdb', 'big', 10737418240, True),
+        ]
+        mock__is_vmedia.return_value = False
+        mock_list_devs.return_value = block_devices
+        # Simulate /dev/sda failing and /dev/sdb succeeding
+        error_output = 'Booo00000ooommmmm'
+        mock_metadata.side_effect = (
+            processutils.ProcessExecutionError(error_output),
+            None,
+        )
+
+        self.assertRaisesRegex(errors.BlockDeviceEraseError, error_output,
+                               self.hardware.erase_devices_metadata,
+                               self.node, [])
+        # Assert all devices are erased independent if one of them
+        # failed previously
+        mock_metadata.assert_has_calls([
+            mock.call('/dev/sda', self.node['uuid']),
+            mock.call('/dev/sdb', self.node['uuid']),
+        ])
+        mock_list_devs.assert_called_once_with(mock.ANY)
+        mock__is_vmedia.assert_has_calls([
+            mock.call(mock.ANY, block_devices[0]),
+            mock.call(mock.ANY, block_devices[1])
+        ])
 
     @mock.patch.object(utils, 'execute')
     def test_get_bmc_address(self, mocked_execute):
@@ -834,14 +1283,189 @@ class TestGenericHardwareManager(test_base.BaseTestCase):
         mocked_execute.side_effect = processutils.ProcessExecutionError()
         self.assertIsNone(self.hardware.get_bmc_address())
 
+    @mock.patch.object(utils, 'execute')
+    def test_get_system_vendor_info(self, mocked_execute):
+        mocked_execute.return_value = (
+            '# dmidecode 2.12\n'
+            'SMBIOS 2.6 present.\n'
+            '\n'
+            'Handle 0x0001, DMI type 1, 27 bytes\n'
+            'System Information\n'
+            '\tManufacturer: NEC\n'
+            '\tProduct Name: Express5800/R120b-2 [N8100-1653]\n'
+            '\tVersion: FR1.3\n'
+            '\tSerial Number: 0800113\n'
+            '\tUUID: 00433468-26A5-DF11-8001-406186F5A681\n'
+            '\tWake-up Type: Power Switch\n'
+            '\tSKU Number: Not Specified\n'
+            '\tFamily: Not Specified\n'
+            '\n'
+            'Handle 0x002E, DMI type 12, 5 bytes\n'
+            'System Configuration Options\n'
+            '\tOption 1: CLR_CMOS: Close to clear CMOS\n'
+            '\tOption 2: BMC_FRB3: Close to stop FRB3 Timer\n'
+            '\tOption 3: BIOS_RECOVERY: Close to run BIOS Recovery\n'
+            '\tOption 4: PASS_DIS: Close to clear Password\n'
+            '\n'
+            'Handle 0x0059, DMI type 32, 11 bytes\n'
+            'System Boot Information\n'
+            '\tStatus: No errors detected\n'
+        ), ''
+        self.assertEqual('Express5800/R120b-2 [N8100-1653]',
+                         self.hardware.get_system_vendor_info().product_name)
+        self.assertEqual('0800113',
+                         self.hardware.get_system_vendor_info().serial_number)
+        self.assertEqual('NEC',
+                         self.hardware.get_system_vendor_info().manufacturer)
 
+    @mock.patch.object(hardware.GenericHardwareManager, 'list_block_devices',
+                       autospec=True)
+    @mock.patch.object(hardware, '_check_for_iscsi', autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(utils, 'guess_root_disk', autospec=True)
+    def test_evaluate_hw_waits_for_disks(self, mocked_root_dev, mocked_sleep,
+                                         mocked_check_for_iscsi,
+                                         mocked_block_dev):
+        mocked_root_dev.side_effect = [
+            errors.DeviceNotFound('boom'),
+            None
+        ]
+
+        result = self.hardware.evaluate_hardware_support()
+
+        self.assertTrue(mocked_check_for_iscsi.called)
+        self.assertEqual(hardware.HardwareSupport.GENERIC, result)
+        mocked_root_dev.assert_called_with(mocked_block_dev.return_value)
+        self.assertEqual(2, mocked_root_dev.call_count)
+        mocked_sleep.assert_called_once_with(CONF.disk_wait_delay)
+
+    @mock.patch.object(hardware.GenericHardwareManager, 'list_block_devices',
+                       autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(utils, 'guess_root_disk', autospec=True)
+    def test_evaluate_hw_waits_for_disks_nonconfigured(self, mocked_root_dev,
+                                                       mocked_sleep,
+                                                       mocked_block_dev):
+        mocked_root_dev.side_effect = [
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            None
+        ]
+
+        self.hardware.evaluate_hardware_support()
+
+        mocked_root_dev.assert_called_with(mocked_block_dev.return_value)
+        self.assertEqual(10, mocked_root_dev.call_count)
+
+    @mock.patch.object(hardware.GenericHardwareManager, 'list_block_devices',
+                       autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(utils, 'guess_root_disk', autospec=True)
+    def test_evaluate_hw_waits_for_disks_configured(self, mocked_root_dev,
+                                                    mocked_sleep,
+                                                    mocked_block_dev):
+        CONF.set_override('disk_wait_attempts', '2', enforce_type=True)
+
+        mocked_root_dev.side_effect = [
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            errors.DeviceNotFound('boom'),
+            None
+        ]
+
+        self.hardware.evaluate_hardware_support()
+
+        mocked_root_dev.assert_called_with(mocked_block_dev.return_value)
+        self.assertEqual(2, mocked_root_dev.call_count)
+
+    @mock.patch.object(hardware.GenericHardwareManager, 'list_block_devices',
+                       autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(utils, 'guess_root_disk', autospec=True)
+    def test_evaluate_hw_disks_timeout_unconfigured(self, mocked_root_dev,
+                                                    mocked_sleep,
+                                                    mocked_block_dev):
+        mocked_root_dev.side_effect = errors.DeviceNotFound('boom')
+
+        self.hardware.evaluate_hardware_support()
+
+        mocked_sleep.assert_called_with(3)
+
+    @mock.patch.object(hardware.GenericHardwareManager, 'list_block_devices',
+                       autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(utils, 'guess_root_disk', autospec=True)
+    def test_evaluate_hw_disks_timeout_configured(self, mocked_root_dev,
+                                                  mocked_sleep,
+                                                  mocked_block_dev):
+        CONF.set_override('disk_wait_delay', '5', enforce_type=True)
+        mocked_root_dev.side_effect = errors.DeviceNotFound('boom')
+
+        self.hardware.evaluate_hardware_support()
+
+        mocked_sleep.assert_called_with(5)
+
+    @mock.patch.object(hardware.GenericHardwareManager, 'list_block_devices',
+                       autospec=True)
+    @mock.patch.object(hardware, '_check_for_iscsi', autospec=True)
+    @mock.patch.object(time, 'sleep', autospec=True)
+    @mock.patch.object(utils, 'guess_root_disk', autospec=True)
+    def test_evaluate_hw_disks_timeout(self, mocked_root_dev, mocked_sleep,
+                                       mocked_check_for_iscsi,
+                                       mocked_block_dev):
+        mocked_root_dev.side_effect = errors.DeviceNotFound('boom')
+
+        result = self.hardware.evaluate_hardware_support()
+
+        self.assertEqual(hardware.HardwareSupport.GENERIC, result)
+        mocked_root_dev.assert_called_with(mocked_block_dev.return_value)
+        self.assertEqual(CONF.disk_wait_attempts,
+                         mocked_root_dev.call_count)
+        mocked_sleep.assert_called_with(CONF.disk_wait_delay)
+
+    @mock.patch.object(utils, 'get_agent_params',
+                       lambda: {'BOOTIF': 'boot:if'})
+    @mock.patch.object(os.path, 'isdir', autospec=True)
+    def test_get_boot_info_pxe_interface(self, mocked_isdir):
+        mocked_isdir.return_value = False
+        result = self.hardware.get_boot_info()
+        self.assertEqual(hardware.BootInfo(current_boot_mode='bios',
+                                           pxe_interface='boot:if'),
+                         result)
+
+    @mock.patch.object(os.path, 'isdir', autospec=True)
+    def test_get_boot_info_bios(self, mocked_isdir):
+        mocked_isdir.return_value = False
+        result = self.hardware.get_boot_info()
+        self.assertEqual(hardware.BootInfo(current_boot_mode='bios'), result)
+        mocked_isdir.assert_called_once_with('/sys/firmware/efi')
+
+    @mock.patch.object(os.path, 'isdir', autospec=True)
+    def test_get_boot_info_uefi(self, mocked_isdir):
+        mocked_isdir.return_value = True
+        result = self.hardware.get_boot_info()
+        self.assertEqual(hardware.BootInfo(current_boot_mode='uefi'), result)
+        mocked_isdir.assert_called_once_with('/sys/firmware/efi')
+
+
+@mock.patch.object(utils, 'execute', autospec=True)
 class TestModuleFunctions(test_base.BaseTestCase):
 
     @mock.patch.object(hardware, '_get_device_vendor', lambda x: "FooTastic")
+    @mock.patch.object(hardware, '_udev_settle', autospec=True)
     @mock.patch.object(hardware.pyudev.Device, "from_device_file")
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_list_all_block_devices_success(self, mocked_execute,
-                                            mocked_fromdevfile):
+    def test_list_all_block_devices_success(self, mocked_fromdevfile,
+                                            mocked_udev, mocked_execute):
         mocked_fromdevfile.return_value = {}
         mocked_execute.return_value = (BLK_DEVICE_TEMPLATE_SMALL, '')
         result = hardware.list_all_block_devices()
@@ -849,23 +1473,66 @@ class TestModuleFunctions(test_base.BaseTestCase):
             'lsblk', '-Pbdi', '-oKNAME,MODEL,SIZE,ROTA,TYPE',
             check_exit_code=[0])
         self.assertEqual(BLK_DEVICE_TEMPLATE_SMALL_DEVICES, result)
+        mocked_udev.assert_called_once_with()
 
-    @mock.patch.object(utils, 'execute', autospec=True)
     @mock.patch.object(hardware, '_get_device_vendor', lambda x: "FooTastic")
-    def test_list_all_block_devices_wrong_block_type(self, mocked_execute):
+    @mock.patch.object(hardware, '_udev_settle', autospec=True)
+    def test_list_all_block_devices_wrong_block_type(self, mocked_udev,
+                                                     mocked_execute):
         mocked_execute.return_value = ('TYPE="foo" MODEL="model"', '')
         result = hardware.list_all_block_devices()
         mocked_execute.assert_called_once_with(
             'lsblk', '-Pbdi', '-oKNAME,MODEL,SIZE,ROTA,TYPE',
             check_exit_code=[0])
         self.assertEqual([], result)
+        mocked_udev.assert_called_once_with()
 
-    @mock.patch.object(utils, 'execute', autospec=True)
-    def test_list_all_block_devices_missing(self, mocked_execute):
+    @mock.patch.object(hardware, '_udev_settle', autospec=True)
+    def test_list_all_block_devices_missing(self, mocked_udev,
+                                            mocked_execute):
         """Test for missing values returned from lsblk"""
         mocked_execute.return_value = ('TYPE="disk" MODEL="model"', '')
-        self.assertRaisesRegexp(
+        self.assertRaisesRegex(
             errors.BlockDeviceError,
             r'^Block device caused unknown error: KNAME, ROTA, SIZE must be '
             r'returned by lsblk.$',
             hardware.list_all_block_devices)
+        mocked_udev.assert_called_once_with()
+
+    def test__udev_settle(self, mocked_execute):
+        hardware._udev_settle()
+        mocked_execute.assert_called_once_with('udevadm', 'settle')
+
+    def test__check_for_iscsi(self, mocked_execute):
+        hardware._check_for_iscsi()
+        mocked_execute.assert_has_calls([
+            mock.call('iscsistart', '-f'),
+            mock.call('iscsistart', '-b')])
+
+    def test__check_for_iscsi_no_iscsi(self, mocked_execute):
+        mocked_execute.side_effect = processutils.ProcessExecutionError()
+        hardware._check_for_iscsi()
+        mocked_execute.assert_has_calls([
+            mock.call('iscsistart', '-f')])
+
+
+def create_hdparm_info(supported=False, enabled=False, frozen=False,
+                       enhanced_erase=False):
+
+    def update_values(values, state, key):
+        if not state:
+            values[key] = 'not' + values[key]
+
+    values = {
+        'supported': '\tsupported',
+        'enabled': '\tenabled',
+        'frozen': '\tfrozen',
+        'enhanced_erase': '\tsupported: enhanced erase',
+    }
+
+    update_values(values, supported, 'supported')
+    update_values(values, enabled, 'enabled')
+    update_values(values, frozen, 'frozen')
+    update_values(values, enhanced_erase, 'enhanced_erase')
+
+    return HDPARM_INFO_TEMPLATE % values

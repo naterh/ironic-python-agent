@@ -13,135 +13,45 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import base64
 import errno
 import glob
+import io
 import os
 import shutil
+import subprocess
+import tarfile
 import tempfile
 import testtools
 
+from ironic_lib import utils as ironic_utils
 import mock
 from oslo_concurrency import processutils
 from oslotest import base as test_base
-import six
 
 from ironic_python_agent import errors
 from ironic_python_agent import utils
 
 
-if six.PY2:
-    OPEN_FUNCTION_NAME = '__builtin__.open'
-else:
-    OPEN_FUNCTION_NAME = 'builtins.open'
+class ExecuteTestCase(test_base.BaseTestCase):
 
-
-class ExecuteTestCase(testtools.TestCase):
-    """This class is a copy of the same class in openstack/ironic."""
-
-    def test_retry_on_failure(self):
-        fd, tmpfilename = tempfile.mkstemp()
-        _, tmpfilename2 = tempfile.mkstemp()
-        try:
-            fp = os.fdopen(fd, 'w+')
-            fp.write('''#!/bin/sh
-# If stdin fails to get passed during one of the runs, make a note.
-if ! grep -q foo
-then
-    echo 'failure' > "$1"
-fi
-# If stdin has failed to get passed during this or a previous run, exit early.
-if grep failure "$1"
-then
-    exit 1
-fi
-runs="$(cat $1)"
-if [ -z "$runs" ]
-then
-    runs=0
-fi
-runs=$(($runs + 1))
-echo $runs > "$1"
-exit 1
-''')
-            fp.close()
-            os.chmod(tmpfilename, 0o755)
-            try:
-                self.assertRaises(processutils.ProcessExecutionError,
-                                  utils.execute,
-                                  tmpfilename, tmpfilename2, attempts=10,
-                                  process_input=b'foo',
-                                  delay_on_retry=False)
-            except OSError as e:
-                if e.errno == errno.EACCES:
-                    self.skipTest("Permissions error detected. "
-                                  "Are you running with a noexec /tmp?")
-                else:
-                    raise
-            fp = open(tmpfilename2, 'r')
-            runs = fp.read()
-            fp.close()
-            self.assertNotEqual(runs.strip(), 'failure',
-                                'stdin did not always get passed correctly')
-            runs = int(runs.strip())
-            self.assertEqual(10, runs,
-                             'Ran %d times instead of 10.' % (runs,))
-        finally:
-            os.unlink(tmpfilename)
-            os.unlink(tmpfilename2)
-
-    def test_unknown_kwargs_raises_error(self):
-        self.assertRaises(processutils.UnknownArgumentError,
-                          utils.execute,
-                          '/usr/bin/env', 'true',
-                          this_is_not_a_valid_kwarg=True)
-
-    def test_check_exit_code_boolean(self):
+    @mock.patch.object(ironic_utils, 'execute', autospec=True)
+    def test_execute(self, mock_execute):
         utils.execute('/usr/bin/env', 'false', check_exit_code=False)
-        self.assertRaises(processutils.ProcessExecutionError,
-                          utils.execute,
-                          '/usr/bin/env', 'false', check_exit_code=True)
-
-    def test_no_retry_on_success(self):
-        fd, tmpfilename = tempfile.mkstemp()
-        _, tmpfilename2 = tempfile.mkstemp()
-        try:
-            fp = os.fdopen(fd, 'w+')
-            fp.write('''#!/bin/sh
-# If we've already run, bail out.
-grep -q foo "$1" && exit 1
-# Mark that we've run before.
-echo foo > "$1"
-# Check that stdin gets passed correctly.
-grep foo
-''')
-            fp.close()
-            os.chmod(tmpfilename, 0o755)
-            try:
-                utils.execute(tmpfilename,
-                              tmpfilename2,
-                              process_input=b'foo',
-                              attempts=2)
-            except OSError as e:
-                if e.errno == errno.EACCES:
-                    self.skipTest("Permissions error detected. "
-                                  "Are you running with a noexec /tmp?")
-                else:
-                    raise
-        finally:
-            os.unlink(tmpfilename)
-            os.unlink(tmpfilename2)
+        mock_execute.assert_called_once_with('/usr/bin/env', 'false',
+                                             check_exit_code=False)
 
 
 class GetAgentParamsTestCase(test_base.BaseTestCase):
 
     @mock.patch('oslo_log.log.getLogger')
-    @mock.patch(OPEN_FUNCTION_NAME)
+    @mock.patch('six.moves.builtins.open')
     def test__read_params_from_file_fail(self, logger_mock, open_mock):
         open_mock.side_effect = Exception
         params = utils._read_params_from_file('file-path')
-        self.assertEqual(params, {})
+        self.assertEqual({}, params)
 
-    @mock.patch(OPEN_FUNCTION_NAME)
+    @mock.patch('six.moves.builtins.open')
     def test__read_params_from_file(self, open_mock):
         kernel_line = 'api-url=http://localhost:9999 baz foo=bar\n'
         open_mock.return_value.__enter__ = lambda s: s
@@ -151,9 +61,9 @@ class GetAgentParamsTestCase(test_base.BaseTestCase):
         params = utils._read_params_from_file('file-path')
         open_mock.assert_called_once_with('file-path')
         read_mock.assert_called_once_with()
-        self.assertEqual(params['api-url'], 'http://localhost:9999')
-        self.assertEqual(params['foo'], 'bar')
-        self.assertFalse('baz' in params)
+        self.assertEqual('http://localhost:9999', params['api-url'])
+        self.assertEqual('bar', params['foo'])
+        self.assertNotIn('baz', params)
 
     @mock.patch.object(utils, '_set_cached_params')
     @mock.patch.object(utils, '_read_params_from_file')
@@ -201,7 +111,7 @@ class GetAgentParamsTestCase(test_base.BaseTestCase):
         self.assertEqual(expected_params, returned_params)
         self.assertEqual(0, set_cache_mock.call_count)
 
-    @mock.patch(OPEN_FUNCTION_NAME)
+    @mock.patch('six.moves.builtins.open')
     @mock.patch.object(glob, 'glob')
     def test__get_vmedia_device(self, glob_mock, open_mock):
 
@@ -223,15 +133,15 @@ class GetAgentParamsTestCase(test_base.BaseTestCase):
     @mock.patch.object(os.path, 'exists')
     @mock.patch.object(os, 'mkdir')
     @mock.patch.object(utils, 'execute')
-    def test__get_vmedia_params_by_label(self, execute_mock, mkdir_mock,
-                                         exists_mock, read_params_mock,
-                                         mkdtemp_mock, rmtree_mock):
+    def test__get_vmedia_params_by_label_lower_case(
+            self, execute_mock, mkdir_mock, exists_mock, read_params_mock,
+            mkdtemp_mock, rmtree_mock):
         mkdtemp_mock.return_value = "/tempdir"
 
         null_output = ["", ""]
         expected_params = {'a': 'b'}
         read_params_mock.return_value = expected_params
-        exists_mock.return_value = True
+        exists_mock.side_effect = [True, False]
         execute_mock.side_effect = [null_output, null_output]
 
         returned_params = utils._get_vmedia_params()
@@ -240,6 +150,36 @@ class GetAgentParamsTestCase(test_base.BaseTestCase):
                                      "/tempdir")
         read_params_mock.assert_called_once_with("/tempdir/parameters.txt")
         exists_mock.assert_called_once_with("/dev/disk/by-label/ir-vfd-dev")
+        execute_mock.assert_any_call('umount', "/tempdir")
+        self.assertEqual(expected_params, returned_params)
+        mkdtemp_mock.assert_called_once_with()
+        rmtree_mock.assert_called_once_with("/tempdir")
+
+    @mock.patch.object(shutil, 'rmtree', autospec=True)
+    @mock.patch.object(tempfile, 'mkdtemp', autospec=True)
+    @mock.patch.object(utils, '_read_params_from_file')
+    @mock.patch.object(os.path, 'exists')
+    @mock.patch.object(os, 'mkdir')
+    @mock.patch.object(utils, 'execute')
+    def test__get_vmedia_params_by_label_upper_case(
+            self, execute_mock, mkdir_mock, exists_mock, read_params_mock,
+            mkdtemp_mock, rmtree_mock):
+        mkdtemp_mock.return_value = "/tempdir"
+
+        null_output = ["", ""]
+        expected_params = {'a': 'b'}
+        read_params_mock.return_value = expected_params
+        exists_mock.side_effect = [False, True]
+        execute_mock.side_effect = [null_output, null_output]
+
+        returned_params = utils._get_vmedia_params()
+
+        execute_mock.assert_any_call('mount', "/dev/disk/by-label/IR-VFD-DEV",
+                                     "/tempdir")
+        read_params_mock.assert_called_once_with("/tempdir/parameters.txt")
+        exists_mock.assert_has_calls(
+            [mock.call("/dev/disk/by-label/ir-vfd-dev"),
+             mock.call("/dev/disk/by-label/IR-VFD-DEV")])
         execute_mock.assert_any_call('umount', "/tempdir")
         self.assertEqual(expected_params, returned_params)
         mkdtemp_mock.assert_called_once_with()
@@ -261,12 +201,15 @@ class GetAgentParamsTestCase(test_base.BaseTestCase):
         null_output = ["", ""]
         expected_params = {'a': 'b'}
         read_params_mock.return_value = expected_params
-        exists_mock.return_value = False
+        exists_mock.side_effect = [False, False]
         execute_mock.side_effect = [null_output, null_output]
         get_device_mock.return_value = "sda"
 
         returned_params = utils._get_vmedia_params()
 
+        exists_mock.assert_has_calls(
+            [mock.call("/dev/disk/by-label/ir-vfd-dev"),
+             mock.call("/dev/disk/by-label/IR-VFD-DEV")])
         execute_mock.assert_any_call('mount', "/dev/sda",
                                      "/tempdir")
         read_params_mock.assert_called_once_with("/tempdir/parameters.txt")
@@ -377,42 +320,6 @@ class GetAgentParamsTestCase(test_base.BaseTestCase):
         mkdtemp_mock.assert_called_once_with()
         rmtree_mock.assert_called_once_with("/tempdir")
 
-    @mock.patch.object(utils, 'get_agent_params')
-    def test_parse_root_device_hints(self, mock_get_params):
-        mock_get_params.return_value = {
-            'root_device': 'vendor=SpongeBob,model=Square%20Pants',
-            'ipa-api-url': 'http://1.2.3.4:1234'
-        }
-        expected = {'vendor': 'spongebob', 'model': 'square pants'}
-        result = utils.parse_root_device_hints()
-        self.assertEqual(expected, result)
-
-    @mock.patch.object(utils, 'get_agent_params')
-    def test_parse_root_device_hints_no_hints(self, mock_get_params):
-        mock_get_params.return_value = {
-            'ipa-api-url': 'http://1.2.3.4:1234'
-        }
-        result = utils.parse_root_device_hints()
-        self.assertEqual({}, result)
-
-    @mock.patch.object(utils, 'get_agent_params')
-    def test_parse_root_device_size(self, mock_get_params):
-        mock_get_params.return_value = {
-            'root_device': 'size=12345',
-            'ipa-api-url': 'http://1.2.3.4:1234'
-        }
-        result = utils.parse_root_device_hints()
-        self.assertEqual(12345, result['size'])
-
-    @mock.patch.object(utils, 'get_agent_params')
-    def test_parse_root_device_not_supported(self, mock_get_params):
-        mock_get_params.return_value = {
-            'root_device': 'foo=bar,size=12345',
-            'ipa-api-url': 'http://1.2.3.4:1234'
-        }
-        self.assertRaises(errors.DeviceNotFound,
-                          utils.parse_root_device_hints)
-
 
 class TestFailures(testtools.TestCase):
     def test_get_error(self):
@@ -435,4 +342,116 @@ class TestFailures(testtools.TestCase):
         f = utils.AccumulatedFailures(exc_class=FakeException)
         self.assertIsNone(f.raise_if_needed())
         f.add('foo')
-        self.assertRaisesRegexp(FakeException, 'foo', f.raise_if_needed)
+        self.assertRaisesRegex(FakeException, 'foo', f.raise_if_needed)
+
+
+class TestUtils(testtools.TestCase):
+
+    def _get_journalctl_output(self, mock_execute, lines=None, units=None):
+        contents = b'Krusty Krab'
+        mock_execute.return_value = (contents, '')
+        data = utils.get_journalctl_output(lines=lines, units=units)
+
+        cmd = ['journalctl', '--full', '--no-pager', '-b']
+        if lines is not None:
+            cmd.extend(['-n', str(lines)])
+        if units is not None:
+            [cmd.extend(['-u', u]) for u in units]
+
+        mock_execute.assert_called_once_with(*cmd, binary=True,
+                                             log_stdout=False)
+        self.assertEqual(contents, data.read())
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_get_journalctl_output(self, mock_execute):
+        self._get_journalctl_output(mock_execute)
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_get_journalctl_output_with_lines(self, mock_execute):
+        self._get_journalctl_output(mock_execute, lines=123)
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_get_journalctl_output_with_units(self, mock_execute):
+        self._get_journalctl_output(mock_execute, units=['fake-unit1',
+                                                         'fake-unit2'])
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_get_journalctl_output_fail(self, mock_execute):
+        mock_execute.side_effect = processutils.ProcessExecutionError()
+        self.assertRaises(errors.CommandExecutionError,
+                          self._get_journalctl_output, mock_execute)
+
+    def test_gzip_and_b64encode(self):
+        contents = b'Squidward Tentacles'
+        io_dict = {'fake-name': io.BytesIO(bytes(contents))}
+        data = utils.gzip_and_b64encode(io_dict=io_dict)
+
+        res = io.BytesIO(base64.b64decode(data))
+        with tarfile.open(fileobj=res) as tar:
+            members = [(m.name, m.size) for m in tar]
+            self.assertEqual([('fake-name', len(contents))], members)
+
+            member = tar.extractfile('fake-name')
+            self.assertEqual(contents, member.read())
+
+    @mock.patch.object(utils, 'execute', autospec=True)
+    def test_get_command_output(self, mock_execute):
+        contents = b'Sandra Sandy Cheeks'
+        mock_execute.return_value = (contents, '')
+        data = utils.get_command_output(['foo'])
+
+        mock_execute.assert_called_once_with(
+            'foo', binary=True, log_stdout=False)
+        self.assertEqual(contents, data.read())
+
+    @mock.patch.object(subprocess, 'check_call')
+    def test_is_journalctl_present(self, mock_call):
+        self.assertTrue(utils.is_journalctl_present())
+
+    @mock.patch.object(subprocess, 'check_call')
+    def test_is_journalctl_present_false(self, mock_call):
+        os_error = OSError()
+        os_error.errno = errno.ENOENT
+        mock_call.side_effect = os_error
+        self.assertFalse(utils.is_journalctl_present())
+
+    @mock.patch.object(utils, 'gzip_and_b64encode')
+    @mock.patch.object(utils, 'is_journalctl_present')
+    @mock.patch.object(utils, 'get_command_output')
+    @mock.patch.object(utils, 'get_journalctl_output')
+    def test_collect_system_logs_journald(
+            self, mock_logs, mock_outputs, mock_journalctl, mock_gzip_b64):
+        mock_journalctl.return_value = True
+        ret = 'Patrick Star'
+        mock_gzip_b64.return_value = ret
+
+        logs_string = utils.collect_system_logs()
+        self.assertEqual(ret, logs_string)
+        mock_logs.assert_called_once_with(lines=None)
+        calls = [mock.call(['ps', 'au']), mock.call(['df', '-a']),
+                 mock.call(['iptables', '-L']), mock.call(['ip', 'addr'])]
+        mock_outputs.assert_has_calls(calls, any_order=True)
+        mock_gzip_b64.assert_called_once_with(
+            file_list=[],
+            io_dict={'journal': mock.ANY, 'ip_addr': mock.ANY, 'ps': mock.ANY,
+                     'df': mock.ANY, 'iptables': mock.ANY})
+
+    @mock.patch.object(utils, 'gzip_and_b64encode')
+    @mock.patch.object(utils, 'is_journalctl_present')
+    @mock.patch.object(utils, 'get_command_output')
+    def test_collect_system_logs_non_journald(
+            self, mock_outputs, mock_journalctl, mock_gzip_b64):
+        mock_journalctl.return_value = False
+        ret = 'SpongeBob SquarePants'
+        mock_gzip_b64.return_value = ret
+
+        logs_string = utils.collect_system_logs()
+        self.assertEqual(ret, logs_string)
+        calls = [mock.call(['dmesg']), mock.call(['ps', 'au']),
+                 mock.call(['df', '-a']), mock.call(['iptables', '-L']),
+                 mock.call(['ip', 'addr'])]
+        mock_outputs.assert_has_calls(calls, any_order=True)
+        mock_gzip_b64.assert_called_once_with(
+            file_list=['/var/log'],
+            io_dict={'iptables': mock.ANY, 'ip_addr': mock.ANY, 'ps': mock.ANY,
+                     'dmesg': mock.ANY, 'df': mock.ANY})

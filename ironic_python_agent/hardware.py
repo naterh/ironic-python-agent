@@ -13,13 +13,18 @@
 # limitations under the License.
 
 import abc
+import binascii
 import functools
 import os
 import shlex
+import time
 
+from ironic_lib import disk_utils
 import netifaces
 from oslo_concurrency import processutils
+from oslo_config import cfg
 from oslo_log import log
+from oslo_utils import strutils
 from oslo_utils import units
 import pint
 import psutil
@@ -29,14 +34,18 @@ import stevedore
 
 from ironic_python_agent import encoding
 from ironic_python_agent import errors
+from ironic_python_agent import netutils
 from ironic_python_agent import utils
 
 _global_managers = None
 LOG = log.getLogger()
+CONF = cfg.CONF
 
 UNIT_CONVERTER = pint.UnitRegistry(filename=None)
 UNIT_CONVERTER.define('MB = []')
 UNIT_CONVERTER.define('GB = 1024 MB')
+
+NODE = None
 
 
 def _get_device_vendor(dev):
@@ -47,6 +56,42 @@ def _get_device_vendor(dev):
             return f.read().strip()
     except IOError:
         LOG.warning("Can't find the device vendor for device %s", dev)
+
+
+def _udev_settle():
+    """Wait for the udev event queue to settle.
+
+    Wait for the udev event queue to settle to make sure all devices
+    are detected once the machine boots up.
+
+    """
+    try:
+        utils.execute('udevadm', 'settle')
+    except processutils.ProcessExecutionError as e:
+        LOG.warning('Something went wrong when waiting for udev '
+                    'to settle. Error: %s', e)
+        return
+
+
+def _check_for_iscsi():
+    """Connect iSCSI shared connected via iBFT or OF.
+
+    iscsistart -f will print the iBFT or OF info.
+    In case such connection exists, we would like to issue
+    iscsistart -b to create a session to the target.
+    - If no connection is detected we simply return.
+    """
+    try:
+        utils.execute('iscsistart', '-f')
+    except (processutils.ProcessExecutionError, EnvironmentError) as e:
+        LOG.debug("No iscsi connection detected. Skipping iscsi. "
+                  "Error: %s", e)
+        return
+    try:
+        utils.execute('iscsistart', '-b')
+    except processutils.ProcessExecutionError as e:
+        LOG.warning("Something went wrong executing 'iscsistart -b' "
+                    "Error: %s", e)
 
 
 def list_all_block_devices(block_type='disk'):
@@ -62,6 +107,7 @@ def list_all_block_devices(block_type='disk'):
     :param block_type: Type of block device to find
     :return: A list of BlockDevices
     """
+    _udev_settle()
 
     columns = ['KNAME', 'MODEL', 'SIZE', 'ROTA', 'TYPE']
     report = utils.execute('lsblk', '-Pbdi', '-o{}'.format(','.join(columns)),
@@ -158,25 +204,33 @@ class BlockDevice(encoding.SerializableComparable):
 
 class NetworkInterface(encoding.SerializableComparable):
     serializable_fields = ('name', 'mac_address', 'switch_port_descr',
-                           'switch_chassis_descr', 'ipv4_address')
+                           'switch_chassis_descr', 'ipv4_address',
+                           'has_carrier', 'lldp')
 
-    def __init__(self, name, mac_addr, ipv4_address=None):
+    def __init__(self, name, mac_addr, ipv4_address=None, has_carrier=True,
+                 lldp=None):
         self.name = name
         self.mac_address = mac_addr
         self.ipv4_address = ipv4_address
-        # TODO(russellhaering): Pull these from LLDP
+        self.has_carrier = has_carrier
+        self.lldp = lldp
+        # TODO(sambetts) Remove these fields in Ocata, they have been
+        # superseded by self.lldp
         self.switch_port_descr = None
         self.switch_chassis_descr = None
 
 
 class CPU(encoding.SerializableComparable):
-    serializable_fields = ('model_name', 'frequency', 'count', 'architecture')
+    serializable_fields = ('model_name', 'frequency', 'count', 'architecture',
+                           'flags')
 
-    def __init__(self, model_name, frequency, count, architecture):
+    def __init__(self, model_name, frequency, count, architecture,
+                 flags=None):
         self.model_name = model_name
         self.frequency = frequency
         self.count = count
         self.architecture = architecture
+        self.flags = flags or []
 
 
 class Memory(encoding.SerializableComparable):
@@ -186,6 +240,23 @@ class Memory(encoding.SerializableComparable):
     def __init__(self, total, physical_mb=None):
         self.total = total
         self.physical_mb = physical_mb
+
+
+class SystemVendorInfo(encoding.SerializableComparable):
+    serializable_fields = ('product_name', 'serial_number', 'manufacturer')
+
+    def __init__(self, product_name, serial_number, manufacturer):
+        self.product_name = product_name
+        self.serial_number = serial_number
+        self.manufacturer = manufacturer
+
+
+class BootInfo(encoding.SerializableComparable):
+    serializable_fields = ('current_boot_mode', 'pxe_interface')
+
+    def __init__(self, current_boot_mode, pxe_interface=None):
+        self.current_boot_mode = current_boot_mode
+        self.pxe_interface = pxe_interface
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -210,6 +281,9 @@ class HardwareManager(object):
         raise errors.IncompatibleHardwareMethodError
 
     def get_bmc_address(self):
+        raise errors.IncompatibleHardwareMethodError()
+
+    def get_boot_info(self):
         raise errors.IncompatibleHardwareMethodError()
 
     def erase_block_device(self, node, block_device):
@@ -258,12 +332,22 @@ class HardwareManager(object):
         return erase_results
 
     def list_hardware_info(self):
+        """Return full hardware inventory as a serializable dict.
+
+        This inventory is sent to Ironic on lookup and to Inspector on
+        inspection.
+
+        :return: a dictionary representing inventory
+        """
+        # NOTE(dtantsur): don't forget to update docs when extending inventory
         hardware_info = {}
         hardware_info['interfaces'] = self.list_network_interfaces()
         hardware_info['cpu'] = self.get_cpus()
         hardware_info['disks'] = self.list_block_devices()
         hardware_info['memory'] = self.get_memory()
         hardware_info['bmc_address'] = self.get_bmc_address()
+        hardware_info['system_vendor'] = self.get_system_vendor_info()
+        hardware_info['boot'] = self.get_boot_info()
         return hardware_info
 
     def get_clean_steps(self, node, ports):
@@ -289,9 +373,17 @@ class HardwareManager(object):
                         parameter, Ironic will consider False (non-abortable).
           }
 
-        If multiple hardware managers return the same step name, the largest
-        hardware support value, then largest priority will be used as the
-        tie-breaker.
+
+        If multiple hardware managers return the same step name, the following
+        logic will be used to determine which manager's step "wins":
+
+            * Keep the step that belongs to HardwareManager with highest
+              HardwareSupport (larger int) value.
+            * If equal support level, keep the step with the higher defined
+              priority (larger int).
+            * If equal support level and priority, keep the step associated
+              with the HardwareManager whose name comes earlier in the
+              alphabet.
 
         The steps will be called using `hardware.dispatch_to_managers` and
         handled by the best suited hardware manager. If you need a step to be
@@ -307,15 +399,7 @@ class HardwareManager(object):
                  dict as defined above
 
         """
-        return [
-            {
-                'step': 'erase_devices',
-                'priority': 10,
-                'interface': 'deploy',
-                'reboot_requested': False,
-                'abortable': True
-            }
-        ]
+        return []
 
     def get_version(self):
         """Get a name and version for this hardware manager.
@@ -345,13 +429,67 @@ class HardwareManager(object):
 
 class GenericHardwareManager(HardwareManager):
     HARDWARE_MANAGER_NAME = 'generic_hardware_manager'
-    HARDWARE_MANAGER_VERSION = '1.0'
+    # 1.1 - Added new clean step called erase_devices_metadata
+    HARDWARE_MANAGER_VERSION = '1.1'
 
     def __init__(self):
         self.sys_path = '/sys'
+        self.lldp_data = {}
 
     def evaluate_hardware_support(self):
+        # Do some initialization before we declare ourself ready
+        _check_for_iscsi()
+        self._wait_for_disks()
         return HardwareSupport.GENERIC
+
+    def _wait_for_disks(self):
+        """Wait for disk to appear
+
+        Wait for at least one suitable disk to show up, otherwise neither
+        inspection not deployment have any chances to succeed.
+
+        """
+
+        for attempt in range(CONF.disk_wait_attempts):
+            try:
+                block_devices = self.list_block_devices()
+                utils.guess_root_disk(block_devices)
+            except errors.DeviceNotFound:
+                LOG.debug('Still waiting for at least one disk to appear, '
+                          'attempt %d of %d', attempt + 1,
+                          CONF.disk_wait_attempts)
+                time.sleep(CONF.disk_wait_delay)
+            else:
+                break
+        else:
+            LOG.warning('No disks detected in %d seconds',
+                        CONF.disk_wait_delay * CONF.disk_wait_attempts)
+
+    def _cache_lldp_data(self, interface_names):
+        interface_names = [name for name in interface_names if name != 'lo']
+        try:
+            raw_lldp_data = netutils.get_lldp_info(interface_names)
+        except Exception:
+            # NOTE(sambetts) The get_lldp_info function will log this exception
+            # and we don't invalidate any existing data in the cache if we fail
+            # to get data to replace it so just return.
+            return
+        for ifname, tlvs in raw_lldp_data.items():
+            # NOTE(sambetts) Convert each type-length-value (TLV) value to hex
+            # so that it can be serialised safely
+            processed_tlvs = []
+            for typ, data in tlvs:
+                try:
+                    processed_tlvs.append((typ,
+                                           binascii.hexlify(data).decode()))
+                except (binascii.Error, binascii.Incomplete) as e:
+                    LOG.warning('An error occurred while processing TLV type '
+                                '%s for interface %s: %s', (typ, ifname, e))
+            self.lldp_data[ifname] = processed_tlvs
+
+    def _get_lldp_data(self, interface_name):
+        if self.lldp_data:
+            return self.lldp_data.get(interface_name)
 
     def _get_interface_info(self, interface_name):
         addr_path = '{0}/class/net/{1}/address'.format(self.sys_path,
@@ -361,7 +499,9 @@ class GenericHardwareManager(HardwareManager):
 
         return NetworkInterface(
             interface_name, mac_addr,
-            ipv4_address=self.get_ipv4_addr(interface_name))
+            ipv4_address=self.get_ipv4_addr(interface_name),
+            has_carrier=self._interface_has_carrier(interface_name),
+            lldp=self._get_lldp_data(interface_name))
 
     def get_ipv4_addr(self, interface_id):
         try:
@@ -371,6 +511,17 @@ class GenericHardwareManager(HardwareManager):
             # No default IPv4 address found
             return None
 
+    def _interface_has_carrier(self, interface_name):
+        path = '{0}/class/net/{1}/carrier'.format(self.sys_path,
+                                                  interface_name)
+        try:
+            with open(path, 'rt') as fp:
+                return fp.read().strip() == '1'
+        except EnvironmentError:
+            LOG.debug('No carrier information for interface %s',
+                      interface_name)
+            return False
+
     def _is_device(self, interface_name):
         device_path = '{0}/class/net/{1}/device'.format(self.sys_path,
                                                         interface_name)
@@ -378,9 +529,12 @@ class GenericHardwareManager(HardwareManager):
 
     def list_network_interfaces(self):
         iface_names = os.listdir('{0}/class/net'.format(self.sys_path))
-        return [self._get_interface_info(name)
-                for name in iface_names
-                if self._is_device(name)]
+        iface_names = [name for name in iface_names if self._is_device(name)]
+
+        if CONF.collect_lldp:
+            self._cache_lldp_data(iface_names)
+
+        return [self._get_interface_info(name) for name in iface_names]
 
     def get_cpus(self):
         lines = utils.execute('lscpu')[0]
@@ -391,11 +545,25 @@ class GenericHardwareManager(HardwareManager):
         # Current CPU frequency can be different from maximum one on modern
         # processors
         freq = cpu_info.get('cpu max mhz', cpu_info.get('cpu mhz'))
+
+        flags = []
+        out = utils.try_execute('grep', '-Em1', '^flags', '/proc/cpuinfo')
+        if out:
+            try:
+                # Example output (much longer for a real system):
+                # flags           : fpu vme de pse
+                flags = out[0].strip().split(':', 1)[1].strip().split()
+            except (IndexError, ValueError):
+                LOG.warning('Malformed CPU flags information: %s', out)
+        else:
+            LOG.warning('Failed to get CPU flags')
+
         return CPU(model_name=cpu_info.get('model name'),
                    frequency=freq,
                    # this includes hyperthreading cores
                    count=int(cpu_info.get('cpu(s)')),
-                   architecture=cpu_info.get('architecture'))
+                   architecture=cpu_info.get('architecture'),
+                   flags=flags)
 
     def get_memory(self):
         # psutil returns a long, so we force it to an int
@@ -405,7 +573,7 @@ class GenericHardwareManager(HardwareManager):
             total = int(psutil.phymem_usage().total)
 
         try:
-            out, _e = utils.execute("dmidecode --type memory | grep Size",
+            out, _e = utils.execute("dmidecode --type 17 | grep Size",
                                     shell=True)
         except (processutils.ProcessExecutionError, OSError) as e:
             LOG.warning("Cannot get real physical memory size: %s", e)
@@ -417,12 +585,20 @@ class GenericHardwareManager(HardwareManager):
                 if not line:
                     continue
 
+                if 'Size:' not in line:
+                    continue
+
+                value = None
                 try:
-                    value = line.split(None, 1)[1].strip()
+                    value = line.split('Size: ', 1)[1]
                     physical += int(UNIT_CONVERTER(value).to_base_units())
                 except Exception as exc:
-                    LOG.error('Cannot parse size expression %s: %s',
-                              line, exc)
+                    if (value == "No Module Installed" or
+                            value == "Not Installed"):
+                        LOG.debug('One memory slot is empty')
+                    else:
+                        LOG.error('Cannot parse size expression %s: %s',
+                                  line, exc)
 
             if not physical:
                 LOG.warning('failed to get real physical RAM, dmidecode '
@@ -434,15 +610,32 @@ class GenericHardwareManager(HardwareManager):
         return list_all_block_devices()
 
     def get_os_install_device(self):
-        block_devices = self.list_block_devices()
-        root_device_hints = utils.parse_root_device_hints()
+        cached_node = get_cached_node()
+        root_device_hints = None
+        if cached_node is not None:
+            root_device_hints = cached_node['properties'].get('root_device')
 
+        block_devices = self.list_block_devices()
         if not root_device_hints:
             return utils.guess_root_disk(block_devices).name
         else:
 
             def match(hint, current_value, device):
                 hint_value = root_device_hints[hint]
+
+                if hint == 'rotational':
+                    hint_value = strutils.bool_from_string(hint_value)
+
+                elif hint == 'size':
+                    try:
+                        hint_value = int(hint_value)
+                    except (ValueError, TypeError):
+                        LOG.warning(
+                            'Root device hint "size" is not an integer. '
+                            'Current value: "%(value)s"; and type: "%(type)s"',
+                            {'value': hint_value, 'type': type(hint_value)})
+                        return False
+
                 if hint_value != current_value:
                     LOG.debug("Root device hint %(hint)s=%(value)s does not "
                               "match the device %(device)s value of "
@@ -455,29 +648,29 @@ class GenericHardwareManager(HardwareManager):
 
             def check_device_attrs(device):
                 for key in ('model', 'wwn', 'serial', 'vendor',
-                            'wwn_with_extension', 'wwn_vendor_extension'):
+                            'wwn_with_extension', 'wwn_vendor_extension',
+                            'name', 'rotational', 'size'):
                     if key not in root_device_hints:
                         continue
 
                     value = getattr(device, key)
-                    if not value:
+                    if value is None:
                         return False
-                    value = utils.normalize(value)
+
+                    if isinstance(value, six.string_types):
+                        value = utils.normalize(value)
+
+                    if key == 'size':
+                        # Since we don't support units yet we expect the size
+                        # in GiB for now
+                        value = value / units.Gi
+
                     if not match(key, value, device.name):
                         return False
 
                 return True
 
             for dev in block_devices:
-                # TODO(lucasagomes): Add support for operators <, >, =, etc...
-                # to better deal with sizes.
-                if 'size' in root_device_hints:
-                    # Since we don't support units yet we expect the size
-                    # in GiB for now
-                    size = dev.size / units.Gi
-                    if not match('size', size, dev.name):
-                        continue
-
                 if check_device_attrs(dev):
                     return dev.name
 
@@ -485,6 +678,37 @@ class GenericHardwareManager(HardwareManager):
                 raise errors.DeviceNotFound(
                     "No suitable device was found for "
                     "deployment using these hints %s" % root_device_hints)
+
+    def get_system_vendor_info(self):
+        product_name = None
+        serial_number = None
+        manufacturer = None
+        try:
+            out, _e = utils.execute("dmidecode --type system",
+                                    shell=True)
+        except (processutils.ProcessExecutionError, OSError) as e:
+            LOG.warning("Cannot get system vendor information: %s", e)
+        else:
+            for line in out.split('\n'):
+                line_arr = line.split(':', 1)
+                if len(line_arr) != 2:
+                    continue
+                if line_arr[0].strip() == 'Product Name':
+                    product_name = line_arr[1].strip()
+                elif line_arr[0].strip() == 'Serial Number':
+                    serial_number = line_arr[1].strip()
+                elif line_arr[0].strip() == 'Manufacturer':
+                    manufacturer = line_arr[1].strip()
+        return SystemVendorInfo(product_name=product_name,
+                                serial_number=serial_number,
+                                manufacturer=manufacturer)
+
+    def get_boot_info(self):
+        boot_mode = 'uefi' if os.path.isdir('/sys/firmware/efi') else 'bios'
+        LOG.debug('The current boot mode is %s', boot_mode)
+        pxe_interface = utils.get_agent_params().get('BOOTIF')
+        return BootInfo(current_boot_mode=boot_mode,
+                        pxe_interface=pxe_interface)
 
     def erase_block_device(self, node, block_device):
 
@@ -494,8 +718,25 @@ class GenericHardwareManager(HardwareManager):
                      block_device.name)
             return
 
-        if self._ata_erase(block_device):
-            return
+        # Note(TheJulia) Use try/except to capture and log the failure
+        # and then revert to attempting to shred the volume if enabled.
+        try:
+            if self._ata_erase(block_device):
+                return
+        except errors.BlockDeviceEraseError as e:
+            info = node.get('driver_internal_info', {})
+            execute_shred = info.get(
+                'agent_continue_if_ata_erase_failed', False)
+            if execute_shred:
+                LOG.warning('Failed to invoke ata_erase, '
+                            'falling back to shred: %(err)s'
+                            % {'err': e})
+            else:
+                msg = ('Failed to invoke ata_erase, '
+                       'fallback to shred is not enabled: %(err)s'
+                       % {'err': e})
+                LOG.error(msg)
+                raise errors.IncompatibleHardwareMethodError(msg)
 
         if self._shred_block_device(node, block_device):
             return
@@ -504,6 +745,35 @@ class GenericHardwareManager(HardwareManager):
                ).format(block_device.name)
         LOG.error(msg)
         raise errors.IncompatibleHardwareMethodError(msg)
+
+    def erase_devices_metadata(self, node, ports):
+        """Attempt to erase the disk devices metadata.
+
+        :param node: Ironic node object
+        :param ports: list of Ironic port objects
+        :raises BlockDeviceEraseError when there's an error erasing the
+                block device
+        """
+        block_devices = self.list_block_devices()
+        erase_errors = {}
+        for dev in block_devices:
+            if self._is_virtual_media_device(dev):
+                LOG.info("Skipping the erase of virtual media device %s",
+                         dev.name)
+                continue
+
+            try:
+                disk_utils.destroy_disk_metadata(dev.name, node['uuid'])
+            except processutils.ProcessExecutionError as e:
+                LOG.error('Failed to erase the metadata on device "%(dev)s". '
+                          'Error: %(error)s', {'dev': dev.name, 'error': e})
+                erase_errors[dev.name] = e
+
+        if erase_errors:
+            excpt_msg = ('Failed to erase the metadata on the device(s): %s' %
+                         '; '.join(['"%s": %s' % (k, v)
+                                    for k, v in erase_errors.items()]))
+            raise errors.BlockDeviceEraseError(excpt_msg)
 
     def _shred_block_device(self, node, block_device):
         """Erase a block device using shred.
@@ -514,9 +784,15 @@ class GenericHardwareManager(HardwareManager):
         """
         info = node.get('driver_internal_info', {})
         npasses = info.get('agent_erase_devices_iterations', 1)
+        args = ('shred', '--force')
+
+        if info.get('agent_erase_devices_zeroize', True):
+            args += ('--zero', )
+
+        args += ('--verbose', '--iterations', str(npasses), block_device.name)
+
         try:
-            utils.execute('shred', '--force', '--zero', '--verbose',
-                          '--iterations', str(npasses), block_device.name)
+            utils.execute(*args)
         except (processutils.ProcessExecutionError, OSError) as e:
             msg = ("Erasing block device %(dev)s failed with error %(err)s ",
                    {'dev': block_device.name, 'err': e})
@@ -570,6 +846,20 @@ class GenericHardwareManager(HardwareManager):
             return False
 
         if 'enabled' in security_lines:
+            # Attempt to unlock the drive in the event it has already been
+            # locked by a previous failed attempt.
+            try:
+                utils.execute('hdparm', '--user-master', 'u',
+                              '--security-unlock', 'NULL', block_device.name)
+                security_lines = self._get_ata_security_lines(block_device)
+            except processutils.ProcessExecutionError as e:
+                raise errors.BlockDeviceEraseError('Security password set '
+                                                   'failed for device '
+                                                   '%(name)s: %(err)s' %
+                                                   {'name': block_device.name,
+                                                    'err': e})
+
+        if 'enabled' in security_lines:
             raise errors.BlockDeviceEraseError(
                 ('Block device {0} already has a security password set'
                  ).format(block_device.name))
@@ -579,16 +869,29 @@ class GenericHardwareManager(HardwareManager):
                 ('Block device {0} is frozen and cannot be erased'
                  ).format(block_device.name))
 
-        utils.execute('hdparm', '--user-master', 'u', '--security-set-pass',
-                      'NULL', block_device.name)
+        try:
+            utils.execute('hdparm', '--user-master', 'u',
+                          '--security-set-pass', 'NULL', block_device.name)
+        except processutils.ProcessExecutionError as e:
+            raise errors.BlockDeviceEraseError('Security password set '
+                                               'failed for device '
+                                               '%(name)s: %(err)s' %
+                                               {'name': block_device.name,
+                                                'err': e})
 
         # Use the 'enhanced' security erase option if it's supported.
         erase_option = '--security-erase'
         if 'not supported: enhanced erase' not in security_lines:
             erase_option += '-enhanced'
 
-        utils.execute('hdparm', '--user-master', 'u', erase_option,
-                      'NULL', block_device.name)
+        try:
+            utils.execute('hdparm', '--user-master', 'u', erase_option,
+                          'NULL', block_device.name)
+        except processutils.ProcessExecutionError as e:
+            raise errors.BlockDeviceEraseError('Erase failed for device '
+                                               '%(name)s: %(err)s' %
+                                               {'name': block_device.name,
+                                                'err': e})
 
         # Verify that security is now 'not enabled'
         security_lines = self._get_ata_security_lines(block_device)
@@ -615,6 +918,24 @@ class GenericHardwareManager(HardwareManager):
             return
 
         return out.strip()
+
+    def get_clean_steps(self, node, ports):
+        return [
+            {
+                'step': 'erase_devices',
+                'priority': 10,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            },
+            {
+                'step': 'erase_devices_metadata',
+                'priority': 99,
+                'interface': 'deploy',
+                'reboot_requested': False,
+                'abortable': True
+            }
+        ]
 
 
 def _compare_extensions(ext1, ext2):
@@ -756,3 +1077,20 @@ def load_managers():
     :raises HardwareManagerNotFound: if no valid hardware managers found
     """
     _get_managers()
+
+
+def cache_node(node):
+    """Store the node object in the hardware module.
+
+    Stores the node object in the hardware module to facilitate the
+    access of a node information in the hardware extensions.
+
+    :param node: Ironic node object
+    """
+    global NODE
+    NODE = node
+
+
+def get_cached_node():
+    """Guard function around the module variable NODE."""
+    return NODE

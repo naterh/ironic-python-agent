@@ -22,11 +22,6 @@ import sys
 from oslo_config import cfg
 from oslo_log import log as logging
 
-# FIXME(lucasagomes): If you don't import the agent module the tests in
-# this file will fail, it was working before because the agent module was
-# being imported at tests/agent.py
-from ironic_python_agent.cmd import agent  # noqa
-
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 
@@ -167,13 +162,12 @@ def _get_lldp_info(interfaces):
     if not interfaces:
         return {}
 
-    socks = [interface[1] for interface in interfaces]
-
     while interfaces:
         LOG.info('Waiting on LLDP info for interfaces: %(interfaces)s, '
                  'timeout: %(timeout)s', {'interfaces': interfaces,
                                           'timeout': CONF.lldp_timeout})
 
+        socks = [interface[1] for interface in interfaces]
         # rlist is a list of sockets ready for reading
         rlist, _, _ = select.select(socks, [], [], CONF.lldp_timeout)
         if not rlist:

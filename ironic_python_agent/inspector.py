@@ -13,10 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
-import io
 import json
-import tarfile
+import os
+import time
 
 import netaddr
 from oslo_concurrency import processutils
@@ -36,16 +35,21 @@ from ironic_python_agent import utils
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 DEFAULT_COLLECTOR = 'default'
+DEFAULT_DHCP_WAIT_TIMEOUT = 60
+
+_DHCP_RETRY_INTERVAL = 2
 _COLLECTOR_NS = 'ironic_python_agent.inspector.collectors'
+_NO_LOGGING_FIELDS = ('logs',)
+
+
+def _extension_manager_err_callback(names):
+    raise errors.InspectionError('Failed to load collector %s' % names)
 
 
 def extension_manager(names):
-    try:
-        return stevedore.NamedExtensionManager(_COLLECTOR_NS,
-                                               names=names,
-                                               name_order=True)
-    except KeyError as exc:
-        raise errors.InspectionError('Failed to load collector %s' % exc)
+    return stevedore.NamedExtensionManager(
+        _COLLECTOR_NS, names=names, name_order=True,
+        on_missing_entrypoints_callback=_extension_manager_err_callback)
 
 
 def inspect():
@@ -108,7 +112,8 @@ def call_inspector(data, failures):
     data['error'] = failures.get_error()
 
     LOG.info('posting collected data to %s', CONF.inspection_callback_url)
-    LOG.debug('collected data: %s', data)
+    LOG.debug('collected data: %s',
+              {k: v for k, v in data.items() if k not in _NO_LOGGING_FIELDS})
 
     encoder = encoding.RESTJSONEncoder()
     data = encoder.encode(data)
@@ -213,6 +218,59 @@ def discover_scheduling_properties(inventory, data, root_disk=None):
             LOG.info('value for %s is %s', key, data[key])
 
 
+def _normalize_mac(mac):
+    """Convert MAC to a well-known format aa:bb:cc:dd:ee:ff."""
+    if '-' in mac:
+        # pxelinux format is 01-aa-bb-cc-dd-ee-ff
+        mac = mac.split('-', 1)[1]
+        mac = mac.replace('-', ':')
+    return mac.lower()
+
+
+def wait_for_dhcp():
+    """Wait until NIC's get their IP addresses via DHCP or timeout happens.
+
+    Depending on the value of inspection_dhcp_all_interfaces configuration
+    option will wait for either all or only PXE booting NIC.
+
+    Note: only supports IPv4 addresses for now.
+
+    :return: True if all NIC's got IP addresses, False if timeout happened.
+             Also returns True if waiting is disabled via configuration.
+    """
+    if not CONF.inspection_dhcp_wait_timeout:
+        return True
+
+    pxe_mac = utils.get_agent_params().get('BOOTIF')
+    if pxe_mac:
+        pxe_mac = _normalize_mac(pxe_mac)
+    elif not CONF.inspection_dhcp_all_interfaces:
+        LOG.warning('No PXE boot interface known - not waiting for it '
+                    'to get the IP address')
+        return False
+
+    threshold = time.time() + CONF.inspection_dhcp_wait_timeout
+    while time.time() <= threshold:
+        interfaces = hardware.dispatch_to_managers('list_network_interfaces')
+        interfaces = [iface for iface in interfaces
+                      if CONF.inspection_dhcp_all_interfaces
+                      or iface.mac_address.lower() == pxe_mac]
+        missing = [iface.name for iface in interfaces
+                   if not iface.ipv4_address]
+        if not missing:
+            return True
+
+        LOG.debug('Still waiting for interfaces %s to get IP addresses',
+                  missing)
+        time.sleep(_DHCP_RETRY_INTERVAL)
+
+    LOG.warning('Not all network interfaces received IP addresses in '
+                '%(timeout)d seconds: %(missing)s',
+                {'timeout': CONF.inspection_dhcp_wait_timeout,
+                 'missing': missing})
+    return False
+
+
 def collect_default(data, failures):
     """The default inspection collector.
 
@@ -227,6 +285,7 @@ def collect_default(data, failures):
     :param data: mutable data that we'll send to inspector
     :param failures: AccumulatedFailures object
     """
+    wait_for_dhcp()
     inventory = hardware.dispatch_to_managers('list_hardware_info')
 
     # In the future we will only need the current version of inventory,
@@ -246,7 +305,7 @@ def collect_default(data, failures):
         LOG.debug('default root device is %s', root_disk.name)
     # Both boot interface and IPMI address might not be present,
     # we don't count it as failure
-    data['boot_interface'] = utils.get_agent_params().get('BOOTIF')
+    data['boot_interface'] = inventory['boot'].pxe_interface
     LOG.debug('boot devices was %s', data['boot_interface'])
     data['ipmi_address'] = inventory.get('bmc_address')
     LOG.debug('BMC IP address: %s', data['ipmi_address'])
@@ -258,7 +317,7 @@ def collect_default(data, failures):
 
 
 def collect_logs(data, failures):
-    """Collect journald logs from the ramdisk.
+    """Collect system logs from the ramdisk.
 
     As inspection runs before any nodes details are known, it's handy to have
     logs returned with data. This collector sends logs to inspector in format
@@ -273,21 +332,10 @@ def collect_logs(data, failures):
     :param failures: AccumulatedFailures object
     """
     try:
-        out, _e = utils.execute('journalctl', '--full', '--no-pager', '-b',
-                                '-n', '10000', binary=True)
-    except (processutils.ProcessExecutionError, OSError):
+        data['logs'] = utils.collect_system_logs(journald_max_lines=10000)
+    except errors.CommandExecutionError:
         LOG.warning('failed to get system journal')
         return
-
-    journal = io.BytesIO(bytes(out))
-    with io.BytesIO() as fp:
-        with tarfile.open(fileobj=fp, mode='w:gz') as tar:
-            tarinfo = tarfile.TarInfo('journal')
-            tarinfo.size = len(out)
-            tar.addfile(tarinfo, journal)
-
-        fp.seek(0)
-        data['logs'] = base64.b64encode(fp.getvalue())
 
 
 def collect_extra_hardware(data, failures):
@@ -319,3 +367,52 @@ def collect_extra_hardware(data, failures):
     except ValueError as exc:
         msg = 'JSON returned from hardware-detect cannot be decoded: %s'
         failures.add(msg, exc)
+
+
+def collect_pci_devices_info(data, failures):
+    """Collect a list of PCI devices.
+
+    Each PCI device entry in list is a dictionary containing vendor_id and
+    product_id keys, which will be then used by the ironic inspector to
+    distinguish various PCI devices.
+
+    The data is gathered from /sys/bus/pci/devices directory.
+
+    :param data: mutable data that we'll send to inspector
+    :param failures: AccumulatedFailures object
+    """
+    pci_devices_path = '/sys/bus/pci/devices'
+    pci_devices_info = []
+    try:
+        subdirs = os.listdir(pci_devices_path)
+    except OSError as exc:
+        msg = 'Failed to get list of PCI devices: %s'
+        failures.add(msg, exc)
+        return
+    for subdir in subdirs:
+        if not os.path.isdir(os.path.join(pci_devices_path, subdir)):
+            continue
+        try:
+            # note(sborkows): ids located in files inside PCI devices
+            # directory are stored in hex format (0x1234 for example) and
+            # we only need that part after 'x' delimiter
+            with open(os.path.join(pci_devices_path, subdir,
+                                   'vendor')) as vendor_file:
+                vendor = vendor_file.read().strip().split('x')[1]
+            with open(os.path.join(pci_devices_path, subdir,
+                                   'device')) as vendor_device:
+                device = vendor_device.read().strip().split('x')[1]
+        except IOError as exc:
+            LOG.warning('Failed to gather vendor id or product id '
+                        'from PCI device %s: %s', subdir, exc)
+            continue
+        except IndexError as exc:
+            LOG.warning('Wrong format of vendor id or product id in PCI '
+                        'device %s: %s', subdir, exc)
+            continue
+        LOG.debug(
+            'Found a PCI device with vendor id %s and product id %s',
+            vendor, device)
+        pci_devices_info.append({'vendor_id': vendor,
+                                 'product_id': device})
+    data['pci_devices'] = pci_devices_info

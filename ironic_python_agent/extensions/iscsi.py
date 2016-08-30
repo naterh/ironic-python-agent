@@ -16,6 +16,7 @@
 #    under the License.
 
 
+from ironic_lib import disk_utils
 from oslo_concurrency import processutils
 from oslo_log import log
 from oslo_utils import uuidutils
@@ -30,12 +31,13 @@ from ironic_python_agent import hardware
 from ironic_python_agent import utils
 
 LOG = log.getLogger(__name__)
+DEFAULT_ISCSI_PORTAL_PORT = 3260
 
 
 def _execute(cmd, error_msg, **kwargs):
     try:
         stdout, stderr = utils.execute(*cmd, **kwargs)
-    except processutils.ProcessExecutionError as e:
+    except (processutils.ProcessExecutionError, OSError) as e:
         LOG.error(error_msg)
         raise errors.ISCSICommandError(error_msg, e.exit_code,
                                        e.stdout, e.stderr)
@@ -49,12 +51,20 @@ def _wait_for_tgtd(attempts=10):
     _execute(cmd, "ISCSI daemon didn't initialize", attempts=attempts)
 
 
-def _start_tgtd(iqn, device):
+def _start_tgtd(iqn, portal_port, device):
     """Start a ISCSI target for the device."""
     # Start ISCSI Target daemon
     _execute(['tgtd'], "Unable to start the ISCSI daemon")
 
     _wait_for_tgtd()
+
+    # tgt service will create default portal on default port 3260.
+    # so no need to create again if input portal_port == 3260.
+    if portal_port != DEFAULT_ISCSI_PORTAL_PORT:
+        cmd = ['tgtadm', '--lld', 'iscsi', '--mode', 'portal', '--op',
+               'new', '--param', 'portal=0.0.0.0:' + str(portal_port)]
+        _execute(cmd, "Error when adding a new portal with portal_port %d"
+                 % portal_port)
 
     cmd = ['tgtadm', '--lld', 'iscsi', '--mode', 'target', '--op',
            'new', '--tid', '1', '--targetname', iqn]
@@ -70,7 +80,7 @@ def _start_tgtd(iqn, device):
                   "initiators for iqn %s" % iqn)
 
 
-def _start_lio(iqn, device):
+def _start_lio(iqn, portal_port, device):
     try:
         storage = rtslib_fb.BlockStorageObject(name=iqn, dev=device)
         target = rtslib_fb.Target(rtslib_fb.FabricModule('iscsi'), iqn,
@@ -89,40 +99,93 @@ def _start_lio(iqn, device):
 
     try:
         # bind to the default port on all interfaces
-        rtslib_fb.NetworkPortal(tpg, '0.0.0.0')
+        rtslib_fb.NetworkPortal(tpg, '0.0.0.0', portal_port)
     except rtslib_fb.utils.RTSLibError as exc:
         msg = 'Failed to publish a target: {0}'.format(exc)
         raise errors.ISCSIError(msg)
 
 
+def clean_up(device):
+    """Clean up iSCSI for a given device."""
+    try:
+        rts_root = rtslib_fb.RTSRoot()
+    except (EnvironmentError, rtslib_fb.RTSLibError) as exc:
+        LOG.info('Linux-IO is not available, not cleaning up. Error: %s.', exc)
+        return
+
+    storage = None
+    for x in rts_root.storage_objects:
+        if x.udev_path == device:
+            storage = x
+            break
+
+    if storage is None:
+        LOG.info('Device %(dev)s not found in the current iSCSI mounts '
+                 '%(mounts)s.',
+                 {'dev': device,
+                  'mounts': [x.udev_path for x in rts_root.storage_objects]})
+        return
+    else:
+        LOG.info('Deleting iSCSI target %(target)s for device %(dev)s.',
+                 {'target': storage.name, 'dev': device})
+
+    try:
+        for x in rts_root.targets:
+            if x.wwn == storage.name:
+                x.delete()
+                break
+
+        storage.delete()
+    except rtslib_fb.utils.RTSLibError as exc:
+        msg = ('Failed to delete iSCSI target %(target)s for device %(dev)s: '
+               '%(error)s') % {'target': storage.name,
+                               'dev': device,
+                               'error': exc}
+        raise errors.ISCSIError(msg)
+
+
 class ISCSIExtension(base.BaseAgentExtension):
     @base.sync_command('start_iscsi_target')
-    def start_iscsi_target(self, iqn=None):
-        """Expose the disk as an ISCSI target."""
+    def start_iscsi_target(self, iqn=None, wipe_disk_metadata=False,
+                           portal_port=None):
+        """Expose the disk as an ISCSI target.
+
+        :param wipe_disk_metadata: if the disk metadata should be wiped out
+                                   before the disk is exposed.
+        """
         # If iqn is not given, generate one
         if iqn is None:
             iqn = 'iqn.2008-10.org.openstack:%s' % uuidutils.generate_uuid()
 
         device = hardware.dispatch_to_managers('get_os_install_device')
+
+        if wipe_disk_metadata:
+            disk_utils.destroy_disk_metadata(
+                device,
+                self.agent.get_node_uuid())
+
         LOG.debug("Starting ISCSI target with iqn %(iqn)s on device "
                   "%(device)s", {'iqn': iqn, 'device': device})
 
         try:
             rts_root = rtslib_fb.RTSRoot()
         except (EnvironmentError, rtslib_fb.RTSLibError) as exc:
-            LOG.warn('Linux-IO is not available, falling back to TGT. '
-                     'Error: %s.', exc)
+            LOG.warning('Linux-IO is not available, falling back to TGT. '
+                        'Error: %s.', exc)
             rts_root = None
 
+        if portal_port is None:
+            portal_port = DEFAULT_ISCSI_PORTAL_PORT
+
         if rts_root is None:
-            _start_tgtd(iqn, device)
+            _start_tgtd(iqn, portal_port, device)
         else:
-            _start_lio(iqn, device)
+            _start_lio(iqn, portal_port, device)
             LOG.debug('Linux-IO configuration: %s', rts_root.dump())
 
-        LOG.info('Created iSCSI target with iqn %(iqn)s on device %(dev)s '
-                 'using %(method)s',
-                 {'iqn': iqn, 'dev': device,
+        LOG.info('Created iSCSI target with iqn %(iqn)s, portal port %(port)d,'
+                 ' on device %(dev)s using %(method)s',
+                 {'iqn': iqn, 'port': portal_port, 'dev': device,
                   'method': 'tgtd' if rts_root is None else 'linux-io'})
 
         return {"iscsi_target_iqn": iqn}

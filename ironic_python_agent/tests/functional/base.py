@@ -21,6 +21,9 @@ from oslotest import base as test_base
 import requests
 
 from ironic_python_agent import agent
+# NOTE(lucasagomes): This import is needed so we can register the
+# configuration options prior to IPA prior to starting the service
+from ironic_python_agent import config  # noqa
 
 
 class FunctionalBase(test_base.BaseTestCase):
@@ -68,13 +71,13 @@ class FunctionalBase(test_base.BaseTestCase):
                 **kwargs):
         """Send a request to the agent and verifies response.
 
-        :param: method type of request to send as a string
-        :param: path desired API endpoint to request, for example 'commands'
-        :param: expect_error error code to expect, if an error is expected
-        :param: expect_json whether to expect a JSON response. if True, convert
+        :param method: type of request to send as a string
+        :param path: desired API endpoint to request, for example 'commands'
+        :param expect_error: error code to expect, if an error is expected
+        :param expect_json: whether to expect a JSON response. if True, convert
                             it to a dict before returning, otherwise return the
                             Response object
-        :param **kwargs: keyword args to pass to the request method
+        :param kwargs: keyword args to pass to the request method
         :raises: HTTPError if an error is returned that was not expected
         :raises: AssertionError if a received HTTP status code does not match
                  expect_error

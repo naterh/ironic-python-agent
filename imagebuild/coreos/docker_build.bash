@@ -7,6 +7,7 @@
 set -e
 
 OUTPUT_FILE="oem/container.tar.gz"
+IPA_ROOT=$(readlink -f $(dirname $0)/../../)
 
 # If there's already a container.tar.gz, don't overwrite it -- instead, bail
 if [[ -e "${OUTPUT_FILE}" ]]; then
@@ -15,8 +16,28 @@ if [[ -e "${OUTPUT_FILE}" ]]; then
 fi
 
 # Build the docker image
-cd ../../
+# Everything from ${IPA_ROOT} will be available under /tmp/ironic-python-agent in Docker
+cd ${IPA_ROOT}
+
+imagebuild/common/generate_upper_constraints.sh ${IPA_ROOT}/upper-constraints.txt
+
+# TODO(jlvilla): Once Docker 1.9 is widely deployed, switch to using the 'ARG'
+# command which was added in Docker 1.9. Currently Ubuntu 14.04 uses Docker
+# 1.6. Using the ARG command will be a much cleaner solution.
+mv proxy.sh .proxy.sh.save || true
+# Create a temporary proxy.sh script, that will be used by the Dockerfile.
+# Since we are calling 'docker build' we can not use --env-file/--env as those
+# are arguments to 'docker run'
+echo '#!/bin/sh' > proxy.sh
+echo 'echo Running: $*' >> proxy.sh
+echo "http_proxy=${http_proxy:-} https_proxy=${https_proxy:-} no_proxy=${no_proxy:-} "'$*' >> proxy.sh
+chmod 0755 proxy.sh
+
 docker build -t oemdocker .
+
+# Restore saved copy
+mv .proxy.sh.save proxy.sh || true
+
 cd -
 
 # Create a UUID to identify the build

@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import copy
+import errno
 import glob
+import io
 import os
 import shutil
+import subprocess
+import tarfile
 import tempfile
+import time
 
+from ironic_lib import utils as ironic_utils
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import units
@@ -28,9 +35,7 @@ from ironic_python_agent import errors
 LOG = logging.getLogger(__name__)
 
 
-SUPPORTED_ROOT_DEVICE_HINTS = set(('size', 'model', 'wwn', 'serial', 'vendor'))
-
-# Agent parameters can be pased by kernel command-line arguments and/or
+# Agent parameters can be passed by kernel command-line arguments and/or
 # by virtual media. Virtual media parameters passed would be available
 # when the agent is started, but might not be available for re-reading
 # later on because:
@@ -46,24 +51,20 @@ SUPPORTED_ROOT_DEVICE_HINTS = set(('size', 'model', 'wwn', 'serial', 'vendor'))
 AGENT_PARAMS_CACHED = dict()
 
 
+COLLECT_LOGS_COMMANDS = {
+    'ps': ['ps', 'au'],
+    'df': ['df', '-a'],
+    'iptables': ['iptables', '-L'],
+    'ip_addr': ['ip', 'addr'],
+}
+
+
 def execute(*cmd, **kwargs):
-    """Convenience wrapper around oslo's execute() method.
+    """Convenience wrapper around ironic_lib's execute() method.
 
-    Executes and logs results from a system command. See docs for
-    oslo_concurrency.processutils.execute for usage.
-
-    :param *cmd: positional arguments to pass to processutils.execute()
-    :param **kwargs: keyword arguments to pass to processutils.execute()
-    :raises: UnknownArgumentError on receiving unknown arguments
-    :raises: ProcessExecutionError
-    :raises: OSError
-    :returns: tuple of (stdout, stderr)
+    Executes and logs results from a system command.
     """
-    result = processutils.execute(*cmd, **kwargs)
-    LOG.debug('Execution completed, command line is "%s"', ' '.join(cmd))
-    LOG.debug('Command stdout is: "%s"', result[0])
-    LOG.debug('Command stderr is: "%s"', result[1])
-    return result
+    return ironic_utils.execute(*cmd, **kwargs)
 
 
 def try_execute(*cmd, **kwargs):
@@ -76,6 +77,7 @@ def try_execute(*cmd, **kwargs):
     returns None in case of failure.
 
     :param *cmd: positional arguments to pass to processutils.execute()
+    :param log_stdout: keyword-only argument: whether to log the output
     :param **kwargs: keyword arguments to pass to processutils.execute()
     :raises: UnknownArgumentError on receiving unknown arguments
     :returns: tuple of (stdout, stderr) or None in some error cases
@@ -132,8 +134,13 @@ def _get_vmedia_params():
     """
     parameters_file = "parameters.txt"
 
-    vmedia_device_file = "/dev/disk/by-label/ir-vfd-dev"
-    if not os.path.exists(vmedia_device_file):
+    vmedia_device_file_lower_case = "/dev/disk/by-label/ir-vfd-dev"
+    vmedia_device_file_upper_case = "/dev/disk/by-label/IR-VFD-DEV"
+    if os.path.exists(vmedia_device_file_lower_case):
+        vmedia_device_file = vmedia_device_file_lower_case
+    elif os.path.exists(vmedia_device_file_upper_case):
+        vmedia_device_file = vmedia_device_file_upper_case
+    else:
 
         # TODO(rameshg87): This block of code is there only for compatibility
         # reasons (so that newer agent can work with older Ironic). Remove
@@ -210,6 +217,13 @@ def get_agent_params():
         # Cache the parameters so that it can be used later on.
         _set_cached_params(params)
 
+        # Check to see if any deprecated parameters have been used
+        deprecated_params = {'lldp-timeout': 'ipa-lldp-timeout'}
+        for old_param, new_param in deprecated_params.items():
+            if params.get(old_param) is not None:
+                LOG.warning("The parameter '%s' has been deprecated. Please "
+                            "use %s instead.", old_param, new_param)
+
     return copy.deepcopy(params)
 
 
@@ -222,44 +236,6 @@ def normalize(string):
     :returns: a normalized version of passed in string
     """
     return parse.unquote(string).lower().strip()
-
-
-def parse_root_device_hints():
-    """Parse the root device hints.
-
-    Parse the root device hints given by Ironic via kernel cmdline
-    or vmedia.
-
-    :returns: A dict with the hints or an empty dict if no hints are
-              passed.
-    :raises: DeviceNotFound if there are unsupported hints.
-
-    """
-    root_device = get_agent_params().get('root_device')
-    if not root_device:
-        return {}
-
-    hints = dict((item.split('=') for item in root_device.split(',')))
-
-    # Find invalid hints for logging
-    not_supported = set(hints) - SUPPORTED_ROOT_DEVICE_HINTS
-    if not_supported:
-        error_msg = ('No device can be found because the following hints: '
-                     '"%(not_supported)s" are not supported by this version '
-                     'of IPA. Supported hints are: "%(supported)s"',
-                     {'not_supported': ', '.join(not_supported),
-                      'supported': ', '.join(SUPPORTED_ROOT_DEVICE_HINTS)})
-        raise errors.DeviceNotFound(error_msg)
-
-    # Normalise the values
-    hints = {k: normalize(v) for k, v in hints.items()}
-
-    if 'size' in hints:
-        # NOTE(lucasagomes): Ironic should validate before passing to
-        # the deploy ramdisk
-        hints['size'] = int(hints['size'])
-
-    return hints
 
 
 class AccumulatedFailures(object):
@@ -329,3 +305,114 @@ def guess_root_disk(block_devices, min_size_required=4 * units.Gi):
     for device in block_devices:
         if device.size >= min_size_required:
             return device
+
+
+def is_journalctl_present():
+    """Check if the journalctl command is present.
+
+    :returns: True if journalctl is present, False if not.
+    """
+    try:
+        devnull = open(os.devnull)
+        subprocess.check_call(['journalctl', '--version'], stdout=devnull,
+                              stderr=devnull)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return False
+    return True
+
+
+def get_command_output(command):
+    """Return the output of a given command.
+
+    :param command: The command to be executed.
+    :raises: CommandExecutionError if the execution of the command fails.
+    :returns: A BytesIO string with the output.
+    """
+    try:
+        out, _ = execute(*command, binary=True, log_stdout=False)
+    except (processutils.ProcessExecutionError, OSError) as e:
+        error_msg = ('Failed to get the output of the command "%(command)s". '
+                     'Error: %(error)s' % {'command': command, 'error': e})
+        LOG.error(error_msg)
+        raise errors.CommandExecutionError(error_msg)
+    return io.BytesIO(out)
+
+
+def get_journalctl_output(lines=None, units=None):
+    """Query the contents of the systemd journal.
+
+    :param lines: Maximum number of lines to retrieve from the
+                  logs. If None, return everything.
+    :param units: A list with the names of the units we should
+                  retrieve the logs from. If None retrieve the logs
+                  for everything.
+    :returns: A log string.
+    """
+    cmd = ['journalctl', '--full', '--no-pager', '-b']
+    if lines is not None:
+        cmd.extend(['-n', str(lines)])
+    if units is not None:
+        [cmd.extend(['-u', u]) for u in units]
+
+    return get_command_output(cmd)
+
+
+def gzip_and_b64encode(io_dict=None, file_list=None):
+    """Gzip and base64 encode files and BytesIO buffers.
+
+    :param io_dict: A dictionary containg whose the keys are the file
+        names and the value a BytesIO object.
+    :param file_list: A list of file path.
+    :returns: A gzipped and base64 encoded string.
+    """
+    io_dict = io_dict or {}
+    file_list = file_list or []
+
+    with io.BytesIO() as fp:
+        with tarfile.open(fileobj=fp, mode='w:gz') as tar:
+            for fname in io_dict:
+                ioobj = io_dict[fname]
+                tarinfo = tarfile.TarInfo(name=fname)
+                tarinfo.size = ioobj.seek(0, 2)
+                tarinfo.mtime = time.time()
+                ioobj.seek(0)
+                tar.addfile(tarinfo, ioobj)
+
+            for f in file_list:
+                tar.add(f)
+
+        fp.seek(0)
+        return base64.b64encode(fp.getvalue())
+
+
+def collect_system_logs(journald_max_lines=None):
+    """Collect system logs.
+
+    Collect system logs, for distributions using systemd the logs will
+    come from journald. On other distributions the logs will come from
+    the /var/log directory and dmesg output.
+
+    :param journald_max_lines: Maximum number of lines to retrieve from
+                               the journald. if None, return everything.
+    :returns: A tar, gzip base64 encoded string with the logs.
+    """
+
+    def try_get_command_output(io_dict, file_name, command):
+        try:
+            io_dict[file_name] = get_command_output(command)
+        except errors.CommandExecutionError:
+            pass
+
+    io_dict = {}
+    file_list = []
+    if is_journalctl_present():
+        io_dict['journal'] = get_journalctl_output(lines=journald_max_lines)
+    else:
+        try_get_command_output(io_dict, 'dmesg', ['dmesg'])
+        file_list.append('/var/log')
+
+    for name, cmd in COLLECT_LOGS_COMMANDS.items():
+        try_get_command_output(io_dict, name, cmd)
+
+    return gzip_and_b64encode(io_dict=io_dict, file_list=file_list)

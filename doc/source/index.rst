@@ -12,6 +12,14 @@ provisioning servers.
 Throughout the remainder of the document, Ironic Python Agent will be
 abbreviated to IPA.
 
+Index
+=====
+
+.. toctree::
+
+    troubleshooting
+    metrics
+
 How it works
 ============
 
@@ -42,7 +50,7 @@ Lookup
 ~~~~~~
 On startup, the agent performs a lookup in Ironic to determine its node UUID
 by sending a hardware profile to the Ironic vendor_passthru lookup endpoint:
-``/v1/nodes/{node_ident}/vendor_passthru/lookup``.
+``/v1/drivers/{driver}/vendor_passthru/lookup``.
 
 Heartbeat
 ~~~~~~~~~
@@ -74,7 +82,58 @@ full endpoint of Ironic Inspector, for example::
 
 Make sure your DHCP environment is set to boot IPA by default.
 
-.. _Ironic Inspector: https://github.com/openstack/ironic-inspector
+.. _Ironic Inspector: http://docs.openstack.org/developer/ironic-inspector/
+
+Hardware Inventory
+------------------
+IPA collects various hardware information using its `Hardware Managers`_,
+and sends it to Ironic on lookup and to Ironic Inspector on Inspection_.
+
+The exact format of the inventory depends on the hardware manager used.
+Here is the basic format expected to be provided by all hardware managers.
+The inventory is a dictionary (JSON object), containing at least the following
+fields:
+
+``cpu``
+    CPU information: ``model_name``, ``frequency``, ``count``,
+    ``architecture`` and ``flags``.
+
+``memory``
+    RAM information: ``total`` (total size in bytes), ``physical_mb``
+    (physically installed memory size in MiB, optional).
+
+    .. note::
+        The difference is that the latter includes the memory region reserved
+        by the kernel and is always slightly bigger. It also matches what
+        the Nova flavor would contain for this node and thus is used by the
+        inspection process instead of ``total``.
+
+``bmc_address``
+    IP address of the node's BMC (aka IPMI address), optional.
+
+``disks``
+    list of disk block devices with fields: ``name``, ``model``,
+    ``size`` (in bytes), ``rotational`` (boolean), ``wwn``, ``serial``,
+    ``vendor``, ``wwn_with_extension``, ``wwn_vendor_extension``.
+
+``interfaces``
+    list of network interfaces with fields: ``name``, ``mac_address``,
+    ``ipv4_address``, ``lldp``. If configuration option ``collect_lldp`` is
+    set to True the ``lldp`` field will be populated by a list of
+    type-length-value (TLV) fields retrieved using the Link Layer Discovery
+    Protocol (LLDP). Currently IPA also returns 2 fields ``switch_port_descr``
+    and ``switch_chassis_descr`` which were reserved for future use, these are
+    now deprecated to be removed in Ocata in favor of including all LLDP data
+    in the ``lddp`` field.
+
+``system_vendor``
+    system vendor information from SMBIOS as reported by ``dmidecode``:
+    ``product_name``, ``serial_number`` and ``manufacturer``.
+
+``boot``
+    boot information with fields: ``current_boot_mode`` (boot mode used for
+    the current boot - BIOS or UEFI) and ``pxe_interface`` (interface used
+    for PXE booting, if any).
 
 Image Builders
 --------------
@@ -84,7 +143,7 @@ run from within a ramdisk.
 
 CoreOS
 ~~~~~~
-The only current supported ramdisk image for IPA is the CoreOS image [1]_.
+One way to build a ramdisk image for IPA is with the CoreOS image [1]_.
 Prebuilt copies of the CoreOS image, suitable for pxe, are available on
 `tarballs.openstack.org <http://tarballs.openstack.org/ironic-python-agent/coreos/files/>`__.
 
@@ -110,10 +169,11 @@ There are several methods you can use to customize the IPA ramdisk:
   additional python packages.
 * Modify the cloud-config.yml [2]_ to perform additional tasks at boot time.
 
-disk-image-builder
+diskimage-builder
 ~~~~~~~~~~~~~~~~~~
-There is currently no production-ready ironic-python-agent ramdisk images
-using disk-image-builder, but one is currently under development [3]_.
+Another way to build a ramdisk image for IPA is by using diskimage-builder
+[3]_. The ironic-agent diskimage-builder element builds the IPA ramdisk, which
+installs all the required packages and configures services as needed.
 
 ISO Images
 ~~~~~~~~~~
@@ -182,7 +242,7 @@ How can I build a custom HardwareManager?
 -----------------------------------------
 Custom HardwareManagers should subclass hardware.HardwareManager or
 hardware.GenericHardwareManager. The only required method is
-evalutate_hardware_support(), which should return one of the enums
+evaluate_hardware_support(), which should return one of the enums
 in hardware.HardwareSupport. Hardware support determines which hardware
 manager is executed first for a given function (see: "`How are methods
 executed on HardwareManagers?`_" for more info). Common methods you
@@ -285,12 +345,12 @@ Generated Developer Documentation
 
 References
 ==========
-.. [0] Enabling Drivers - http://docs.openstack.org/developer/ironic/deploy/drivers.html#ironic-python-agent-agent
+.. [0] Enabling Drivers - http://docs.openstack.org/developer/ironic/drivers/ipa.html#ipa
 .. [1] CoreOS PXE Images - https://coreos.com/docs/running-coreos/bare-metal/booting-with-pxe/
 .. [2] CoreOS Cloud Init - https://coreos.com/docs/cluster-management/setup/cloudinit-cloud-config/
-.. [3] DIB Element for IPA - https://github.com/openstack/diskimage-builder/tree/master/elements/ironic-agent
+.. [3] DIB Element for IPA - http://docs.openstack.org/developer/diskimage-builder/elements/ironic-agent/README.html
 .. [4] Ironic Cleaning - http://docs.openstack.org/developer/ironic/deploy/cleaning.html
-.. [5] cloud-config.yaml - https://github.com/openstack/ironic-python-agent/blob/master/imagebuild/coreos/oem/cloud-config.yml
+.. [5] cloud-config.yaml - https://git.openstack.org/cgit/openstack/ironic-python-agent/tree/imagebuild/coreos/oem/cloud-config.yml
 
 Indices and tables
 ==================
@@ -298,4 +358,3 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
-

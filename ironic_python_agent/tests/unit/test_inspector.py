@@ -13,18 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
 import collections
 import copy
-import io
-import tarfile
-import unittest
+import os
+import time
 
 import mock
 from oslo_concurrency import processutils
 from oslo_config import cfg
+from oslotest import base as test_base
 import requests
-import six
 import stevedore
 
 from ironic_python_agent import errors
@@ -48,27 +46,28 @@ class AcceptingFailure(mock.Mock):
             failure, expect_error)
 
 
-class TestMisc(unittest.TestCase):
+class TestMisc(test_base.BaseTestCase):
     def test_default_collector_loadable(self):
         ext = inspector.extension_manager([inspector.DEFAULT_COLLECTOR])
         self.assertIs(ext[inspector.DEFAULT_COLLECTOR].plugin,
                       inspector.collect_default)
 
     def test_raise_on_wrong_collector(self):
-        self.assertRaisesRegexp(errors.InspectionError,
-                                'foobar',
-                                inspector.extension_manager,
-                                ['foobar'])
+        self.assertRaisesRegex(errors.InspectionError,
+                               'foobar',
+                               inspector.extension_manager,
+                               ['foobar'])
 
 
 @mock.patch.object(inspector, 'setup_ipmi_credentials', autospec=True)
 @mock.patch.object(inspector, 'call_inspector', new_callable=AcceptingFailure)
 @mock.patch.object(stevedore, 'NamedExtensionManager', autospec=True)
-class TestInspect(unittest.TestCase):
+class TestInspect(test_base.BaseTestCase):
     def setUp(self):
         super(TestInspect, self).setUp()
-        CONF.set_override('inspection_callback_url', 'http://foo/bar')
-        CONF.set_override('inspection_collectors', '')
+        CONF.set_override('inspection_callback_url', 'http://foo/bar',
+                          enforce_type=True)
+        CONF.set_override('inspection_collectors', '', enforce_type=True)
         self.mock_collect = AcceptingFailure()
         self.mock_ext = mock.Mock(spec=['plugin', 'name'],
                                   plugin=self.mock_collect)
@@ -85,7 +84,8 @@ class TestInspect(unittest.TestCase):
         mock_setup_ipmi.assert_called_once_with(mock_call.return_value)
 
     def test_collectors_option(self, mock_ext_mgr, mock_call, mock_setup_ipmi):
-        CONF.set_override('inspection_collectors', 'foo,bar')
+        CONF.set_override('inspection_collectors', 'foo,bar',
+                          enforce_type=True)
         mock_ext_mgr.return_value = [
             mock.Mock(spec=['name', 'plugin'], plugin=AcceptingFailure()),
             mock.Mock(spec=['name', 'plugin'], plugin=AcceptingFailure()),
@@ -101,18 +101,19 @@ class TestInspect(unittest.TestCase):
         mock_ext_mgr.return_value = [self.mock_ext]
         self.mock_collect.side_effect = RuntimeError('boom')
 
-        self.assertRaisesRegexp(errors.InspectionError,
-                                'boom', inspector.inspect)
+        self.assertRaisesRegex(errors.InspectionError,
+                               'boom', inspector.inspect)
 
         self.mock_collect.assert_called_with_failure()
         mock_call.assert_called_with_failure(expect_error=True)
         self.assertFalse(mock_setup_ipmi.called)
 
     def test_extensions_failed(self, mock_ext_mgr, mock_call, mock_setup_ipmi):
-        CONF.set_override('inspection_collectors', 'foo,bar')
+        CONF.set_override('inspection_collectors', 'foo,bar',
+                          enforce_type=True)
         mock_ext_mgr.side_effect = RuntimeError('boom')
 
-        self.assertRaisesRegexp(RuntimeError, 'boom', inspector.inspect)
+        self.assertRaisesRegex(RuntimeError, 'boom', inspector.inspect)
 
         mock_call.assert_called_with_failure(expect_error=True)
         self.assertFalse(mock_setup_ipmi.called)
@@ -130,10 +131,11 @@ class TestInspect(unittest.TestCase):
 
 
 @mock.patch.object(requests, 'post', autospec=True)
-class TestCallInspector(unittest.TestCase):
+class TestCallInspector(test_base.BaseTestCase):
     def setUp(self):
         super(TestCallInspector, self).setUp()
-        CONF.set_override('inspection_callback_url', 'url')
+        CONF.set_override('inspection_callback_url', 'url',
+                          enforce_type=True)
 
     def test_ok(self, mock_post):
         failures = utils.AccumulatedFailures()
@@ -171,7 +173,7 @@ class TestCallInspector(unittest.TestCase):
 
 
 @mock.patch.object(utils, 'execute', autospec=True)
-class TestSetupIpmiCredentials(unittest.TestCase):
+class TestSetupIpmiCredentials(test_base.BaseTestCase):
     def setUp(self):
         super(TestSetupIpmiCredentials, self).setUp()
         self.resp = {'ipmi_username': 'user',
@@ -222,7 +224,7 @@ class TestSetupIpmiCredentials(unittest.TestCase):
         self.assertEqual(expected, mock_call.call_args_list)
 
 
-class BaseDiscoverTest(unittest.TestCase):
+class BaseDiscoverTest(test_base.BaseTestCase):
     def setUp(self):
         super(BaseDiscoverTest, self).setUp()
         self.inventory = {
@@ -253,6 +255,8 @@ class BaseDiscoverTest(unittest.TestCase):
                                      rotational=True)
             ],
             'bmc_address': '1.2.3.4',
+            'boot': hardware.BootInfo(current_boot_mode='bios',
+                                      pxe_interface='boot:if')
         }
         self.failures = utils.AccumulatedFailures()
         self.data = {}
@@ -322,13 +326,13 @@ class TestDiscoverSchedulingProperties(BaseDiscoverTest):
                          self.data)
 
 
-@mock.patch.object(utils, 'get_agent_params',
-                   lambda: {'BOOTIF': 'boot:if'})
+@mock.patch.object(inspector, 'wait_for_dhcp', autospec=True)
 @mock.patch.object(inspector, 'discover_scheduling_properties', autospec=True)
 @mock.patch.object(inspector, 'discover_network_properties', autospec=True)
 @mock.patch.object(hardware, 'dispatch_to_managers', autospec=True)
 class TestCollectDefault(BaseDiscoverTest):
-    def test_ok(self, mock_dispatch, mock_discover_net, mock_discover_sched):
+    def test_ok(self, mock_dispatch, mock_discover_net, mock_discover_sched,
+                mock_wait_for_dhcp):
         mock_dispatch.return_value = self.inventory
 
         inspector.collect_default(self.data, self.failures)
@@ -347,9 +351,10 @@ class TestCollectDefault(BaseDiscoverTest):
         mock_discover_sched.assert_called_once_with(
             self.inventory, self.data,
             root_disk=self.inventory['disks'][0])
+        mock_wait_for_dhcp.assert_called_once_with()
 
     def test_no_root_disk(self, mock_dispatch, mock_discover_net,
-                          mock_discover_sched):
+                          mock_discover_sched, mock_wait_for_dhcp):
         mock_dispatch.return_value = self.inventory
         self.inventory['disks'] = []
 
@@ -367,45 +372,29 @@ class TestCollectDefault(BaseDiscoverTest):
                                                   self.failures)
         mock_discover_sched.assert_called_once_with(
             self.inventory, self.data, root_disk=None)
+        mock_wait_for_dhcp.assert_called_once_with()
+
+
+@mock.patch.object(utils, 'collect_system_logs', autospec=True)
+class TestCollectLogs(test_base.BaseTestCase):
+
+    def test(self, mock_collect):
+        data = {}
+        ret = 'SpongeBob SquarePants'
+        mock_collect.return_value = ret
+
+        inspector.collect_logs(data, None)
+        self.assertEqual({'logs': ret}, data)
+
+    def test_fail(self, mock_collect):
+        data = {}
+        mock_collect.side_effect = errors.CommandExecutionError('boom')
+        self.assertIsNone(inspector.collect_logs(data, None))
+        self.assertNotIn('logs', data)
 
 
 @mock.patch.object(utils, 'execute', autospec=True)
-class TestCollectLogs(unittest.TestCase):
-    def test(self, mock_execute):
-        contents = 'journal contents \xd0\xbc\xd1\x8f\xd1\x83'
-        # That's how execute() works with binary=True
-        if six.PY3:
-            contents = b'journal contents \xd0\xbc\xd1\x8f\xd1\x83'
-        else:
-            contents = 'journal contents \xd0\xbc\xd1\x8f\xd1\x83'
-        expected_contents = u'journal contents \u043c\u044f\u0443'
-        mock_execute.return_value = (contents, '')
-
-        data = {}
-        inspector.collect_logs(data, None)
-        res = io.BytesIO(base64.b64decode(data['logs']))
-
-        with tarfile.open(fileobj=res) as tar:
-            members = [(m.name, m.size) for m in tar]
-            self.assertEqual([('journal', len(contents))], members)
-
-            member = tar.extractfile('journal')
-            self.assertEqual(expected_contents, member.read().decode('utf-8'))
-
-        mock_execute.assert_called_once_with('journalctl', '--full',
-                                             '--no-pager', '-b',
-                                             '-n', '10000', binary=True)
-
-    def test_no_journal(self, mock_execute):
-        mock_execute.side_effect = OSError()
-
-        data = {}
-        inspector.collect_logs(data, None)
-        self.assertFalse(data)
-
-
-@mock.patch.object(utils, 'execute', autospec=True)
-class TestCollectExtraHardware(unittest.TestCase):
+class TestCollectExtraHardware(test_base.BaseTestCase):
     def setUp(self):
         super(TestCollectExtraHardware, self).setUp()
         self.data = {}
@@ -448,3 +437,155 @@ class TestCollectExtraHardware(unittest.TestCase):
         self.assertNotIn('data', self.data)
         self.assertTrue(self.failures)
         mock_execute.assert_called_once_with('hardware-detect')
+
+
+@mock.patch.object(os, 'listdir', autospec=True)
+class TestCollectPciDevicesInfo(test_base.BaseTestCase):
+    def setUp(self):
+        super(TestCollectPciDevicesInfo, self).setUp()
+        self.data = {}
+        self.failures = utils.AccumulatedFailures()
+
+    @mock.patch.object(os.path, 'isdir', autospec=True)
+    def test_success(self, mock_isdir, mock_listdir):
+        subdirs = ['foo', 'bar']
+        mock_listdir.return_value = subdirs
+        mock_isdir.return_value = True
+        reads = ['0x1234', '0x5678', '0x9876', '0x5432']
+        expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678'},
+                                {'vendor_id': '9876', 'product_id': '5432'}]
+
+        mock_open = mock.mock_open()
+        with mock.patch('six.moves.builtins.open', mock_open):
+            mock_read = mock_open.return_value.read
+            mock_read.side_effect = reads
+            inspector.collect_pci_devices_info(self.data, self.failures)
+
+        self.assertEqual(2 * len(subdirs), mock_open.call_count)
+        self.assertListEqual(expected_pci_devices, self.data['pci_devices'])
+
+    def test_wrong_path(self, mock_listdir):
+        mock_listdir.side_effect = OSError()
+
+        inspector.collect_pci_devices_info(self.data, self.failures)
+
+        self.assertNotIn('pci_devices', self.data)
+        self.assertEqual(1, len(self.failures._failures))
+
+    @mock.patch.object(os.path, 'isdir', autospec=True)
+    def test_bad_pci_device_info(self, mock_isdir, mock_listdir):
+        subdirs = ['foo', 'bar', 'baz']
+        mock_listdir.return_value = subdirs
+        mock_isdir.return_value = True
+        reads = ['0x1234', '0x5678', '0x9876', IOError, IndexError,
+                 '0x5432']
+        expected_pci_devices = [{'vendor_id': '1234', 'product_id': '5678'}]
+
+        mock_open = mock.mock_open()
+        with mock.patch('six.moves.builtins.open', mock_open):
+            mock_read = mock_open.return_value.read
+            mock_read.side_effect = reads
+            inspector.collect_pci_devices_info(self.data, self.failures)
+
+        # note(sborkows): due to throwing IOError, the corresponding mock_open
+        # will not be called, so there are 5 mock_open calls in total
+        self.assertEqual(5, mock_open.call_count)
+        self.assertListEqual(expected_pci_devices, self.data['pci_devices'])
+
+
+@mock.patch.object(utils, 'get_agent_params', lambda: {'BOOTIF': '01-cdef'})
+@mock.patch.object(hardware, 'dispatch_to_managers', autospec=True)
+class TestWaitForDhcp(test_base.BaseTestCase):
+    def setUp(self):
+        super(TestWaitForDhcp, self).setUp()
+        CONF.set_override('inspection_dhcp_wait_timeout',
+                          inspector.DEFAULT_DHCP_WAIT_TIMEOUT)
+
+    @mock.patch.object(time, 'sleep', autospec=True)
+    def test_all(self, mocked_sleep, mocked_dispatch):
+        CONF.set_override('inspection_dhcp_all_interfaces', True)
+        # We used to rely on has_carrier check, but we've found it unreliable
+        # in the DIB image, so we ignore its value.
+        mocked_dispatch.side_effect = [
+            [hardware.NetworkInterface(name='em0', mac_addr='abcd',
+                                       ipv4_address=None,
+                                       has_carrier=False),
+             hardware.NetworkInterface(name='em1', mac_addr='cdef',
+                                       ipv4_address='1.2.3.4',
+                                       has_carrier=False)],
+            [hardware.NetworkInterface(name='em0', mac_addr='abcd',
+                                       ipv4_address=None,
+                                       has_carrier=True),
+             hardware.NetworkInterface(name='em1', mac_addr='cdef',
+                                       ipv4_address='1.2.3.4',
+                                       has_carrier=True)],
+            [hardware.NetworkInterface(name='em0', mac_addr='abcd',
+                                       ipv4_address='1.1.1.1',
+                                       has_carrier=True),
+             hardware.NetworkInterface(name='em1', mac_addr='cdef',
+                                       ipv4_address='1.2.3.4',
+                                       has_carrier=True)],
+        ]
+
+        self.assertTrue(inspector.wait_for_dhcp())
+
+        mocked_dispatch.assert_called_with('list_network_interfaces')
+        self.assertEqual(2, mocked_sleep.call_count)
+        self.assertEqual(3, mocked_dispatch.call_count)
+
+    @mock.patch.object(time, 'sleep', autospec=True)
+    def test_boot_only(self, mocked_sleep, mocked_dispatch):
+        CONF.set_override('inspection_dhcp_all_interfaces', False)
+        mocked_dispatch.side_effect = [
+            [hardware.NetworkInterface(name='em0', mac_addr='abcd',
+                                       ipv4_address=None,
+                                       has_carrier=False),
+             hardware.NetworkInterface(name='em1', mac_addr='cdef',
+                                       ipv4_address=None,
+                                       has_carrier=False)],
+            [hardware.NetworkInterface(name='em0', mac_addr='abcd',
+                                       ipv4_address=None,
+                                       has_carrier=True),
+             hardware.NetworkInterface(name='em1', mac_addr='cdef',
+                                       ipv4_address='1.2.3.4',
+                                       has_carrier=True)],
+        ]
+
+        self.assertTrue(inspector.wait_for_dhcp())
+
+        mocked_dispatch.assert_called_with('list_network_interfaces')
+        self.assertEqual(1, mocked_sleep.call_count)
+        self.assertEqual(2, mocked_dispatch.call_count)
+
+    @mock.patch.object(inspector, '_DHCP_RETRY_INTERVAL', 0.01)
+    def test_timeout(self, mocked_dispatch):
+        CONF.set_override('inspection_dhcp_all_interfaces', True)
+        CONF.set_override('inspection_dhcp_wait_timeout', 0.02)
+
+        mocked_dispatch.return_value = [
+            hardware.NetworkInterface(name='em0', mac_addr='abcd',
+                                      ipv4_address=None),
+            hardware.NetworkInterface(name='em1', mac_addr='abcd',
+                                      ipv4_address='1.2.3.4'),
+        ]
+
+        self.assertFalse(inspector.wait_for_dhcp())
+
+        mocked_dispatch.assert_called_with('list_network_interfaces')
+
+    def test_disabled(self, mocked_dispatch):
+        CONF.set_override('inspection_dhcp_wait_timeout', 0)
+
+        self.assertTrue(inspector.wait_for_dhcp())
+
+        self.assertFalse(mocked_dispatch.called)
+
+
+class TestNormalizeMac(test_base.BaseTestCase):
+    def test_correct_mac(self):
+        self.assertEqual('11:22:33:aa:bb:cc',
+                         inspector._normalize_mac('11:22:33:aa:BB:cc'))
+
+    def test_pxelinux_mac(self):
+        self.assertEqual('11:22:33:aa:bb:cc',
+                         inspector._normalize_mac('01-11-22-33-aa-BB-cc'))
